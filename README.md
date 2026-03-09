@@ -100,6 +100,14 @@ Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
 | 7 | `vllm/.../fla/ops/fused_recurrent.py` | Fix GDN (Gated Delta Net) Triton kernel for Qwen3.5 |
 | 8 | `vllm/.../models/gpt_oss.py` | Add `_quantize_moe_weight_mxfp4()` helper |
 
+### triton_allocator.patch
+
+Fixes Triton's `NullAllocator` crash in Ray distributed workers. The `ContextVar`-based allocator
+does not propagate to Ray worker threads, causing `RuntimeError` when Triton kernels require
+runtime memory allocation (e.g., FLA's `solve_tril` during GDN prefill). The patch makes
+`NullAllocator.__call__` fall back to `torch.cuda.caching_allocator_alloc` instead of raising.
+Required for multi-node (TP>=2) inference with Qwen3.5-35B-A3B.
+
 ### flashinfer_cutlass_sfb_layout_fix.patch
 
 Fixes a copy-paste bug in FlashInfer 0.6.4's bundled CUTLASS 4.2.1 headers where `layout_SFB`
@@ -148,6 +156,9 @@ cd "$SITE"
 # Apply vLLM patch
 patch -p0 < /path/to/patches/vllm_all.patch
 
+# Apply Triton allocator fix (required for multi-node / TP>=2)
+patch -p0 < /path/to/patches/triton_allocator.patch
+
 # Apply FlashInfer CUTLASS fix (only needed for CUTLASS_FP4 backend)
 patch -p0 < /path/to/patches/flashinfer_cutlass_sfb_layout_fix.patch
 ```
@@ -155,6 +166,7 @@ patch -p0 < /path/to/patches/flashinfer_cutlass_sfb_layout_fix.patch
 ### Step 4: Clear caches
 
 ```bash
+rm -rf ~/.cache/triton/
 rm -rf ~/.cache/flashinfer/
 rm -rf ~/.cache/vllm/torch_compile_cache/
 rm -rf ~/.cache/vllm/torch_aot_compile/
@@ -264,7 +276,7 @@ standard PyTorch pip wheels (max compute capability 12.0) or vanilla vLLM. Key i
 - Missing PTX instructions (`cvt.rn.satfinite.e2m1x2.f32`) for E2M1 conversion
 - FlashInfer CUTLASS MXFP4 backend requiring TMA/wgmma (unavailable on SM121)
 - NCCL 2.28.9 CUDAGraph + multi-node deadlock bug
-- Triton allocator ContextVar not propagating to Ray worker threads (fixed in Triton 3.6.0)
+- Triton allocator ContextVar not propagating to Ray worker threads
 
 This work builds on the efforts of the DGX Spark community who identified and documented these SM121 issues.
 See: [DGX Spark SM121 Software Support Discussion (NVIDIA Forums)](https://forums.developer.nvidia.com/t/dgx-spark-sm121-software-support-is-severely-lacking-official-roadmap-needed/357663)
