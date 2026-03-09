@@ -1,0 +1,1410 @@
+--- vllm/envs.py	2026-03-09 02:10:13.747087730 +0900
++++ vllm/envs.py	2026-03-09 00:30:11.875930026 +0900
+@@ -145,6 +145,7 @@
+     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+     VLLM_MXFP4_USE_MARLIN: bool | None = None
++    VLLM_MXFP4_BACKEND: str = "auto"
+     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
+     VLLM_V1_USE_OUTLINES_CACHE: bool = False
+     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
+@@ -1138,6 +1139,7 @@
+     "VLLM_MXFP4_USE_MARLIN": lambda: maybe_convert_bool(
+         os.environ.get("VLLM_MXFP4_USE_MARLIN", None)
+     ),
++    "VLLM_MXFP4_BACKEND": lambda: os.getenv("VLLM_MXFP4_BACKEND", "auto").lower(),
+     # The activation dtype for marlin kernel
+     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
+         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+--- vllm/model_executor/layers/quantization/utils/mxfp4_utils.py	2026-03-09 02:10:13.796790286 +0900
++++ vllm/model_executor/layers/quantization/utils/mxfp4_utils.py	2026-03-09 00:29:44.596402409 +0900
+@@ -188,3 +188,64 @@
+     quant_dequant_mxfp4 = torch.ops.vllm.quant_dequant_mxfp4
+ except AttributeError as error:
+     raise error
++
++
++def mxfp4_e2m1_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """Quantize a tensor to MXFP4 format for Marlin kernel.
++
++    Uses fp4_quantize with linear (non-swizzled) scale layout for
++    compatibility with Marlin's prepare_fp4_layer_for_marlin().
++
++    Args:
++        x: Input tensor of shape [N, K] with dtype fp16/bf16.
++            Must already be on the target CUDA device.
++
++    Returns:
++        Tuple of:
++            - Quantized tensor of shape [N, K/2] with dtype uint8 (packed FP4)
++            - Scale factors tensor of shape [N, K/32] with dtype uint8 (E8M0)
++    """
++    try:
++        from flashinfer import fp4_quantize
++    except ImportError as err:
++        raise ImportError(
++            "The package `flashinfer` is required to do "
++            "MX-FP4 quantization. Please install it with "
++            "`pip install flashinfer`"
++        ) from err
++
++    # Preserve input device for multi-GPU correctness
++    device = x.device
++
++    # Calculate global scale factor
++    # 448 * 6 = 2688 is the max representable value in E2M1 (6) * E8M0 max (448)
++    max_val = x.abs().max()
++
++    # Handle pathological cases (NaN/Inf in weights)
++    if not torch.isfinite(max_val):
++        max_val = x.float().abs().nan_to_num().max()
++
++    max_val_f32 = max_val.float()
++
++    eps = 1e-30
++    max_val_clamped = torch.clamp(max_val_f32, min=eps)
++    global_scale = (448 * 6) / max_val_clamped
++
++    if not isinstance(global_scale, torch.Tensor):
++        global_scale = torch.tensor(global_scale, dtype=torch.float32, device=device)
++    else:
++        global_scale = global_scale.to(device=device, dtype=torch.float32)
++
++    # Use fp4_quantize with linear layout for Marlin compatibility
++    x_q, x_scales = fp4_quantize(
++        x,
++        global_scale,
++        sf_vec_size=32,
++        sf_use_ue8m0=True,
++        is_sf_swizzled_layout=False,
++    )
++
++    # Ensure scales have proper 2D shape [N, K/32]
++    if x_scales.ndim == 1:
++        x_scales = x_scales.view(x.size(0), -1)
++    return x_q, x_scales
+--- vllm/model_executor/layers/quantization/mxfp4.py	2026-03-09 02:10:13.794140655 +0900
++++ vllm/model_executor/layers/quantization/mxfp4.py	2026-03-09 00:31:33.005458958 +0900
+@@ -35,7 +35,7 @@
+     UnfusedOAITritonExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.trtllm_moe import TrtLlmGenExperts
+-from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
+ from vllm.model_executor.layers.quantization import QuantizationMethods
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+@@ -45,6 +45,8 @@
+     get_marlin_input_dtype,
+ )
+ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
++    apply_fp4_marlin_linear,
++    prepare_fp4_layer_for_marlin,
+     prepare_moe_fp4_layer_for_marlin,
+ )
+ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+@@ -53,7 +55,9 @@
+     get_padding_alignment,
+ )
+ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+-from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
++from vllm.model_executor.parameter import ModelWeightParameter
++from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+ from vllm.platforms import current_platform
+ from vllm.utils.flashinfer import has_flashinfer
+ from vllm.utils.import_utils import has_triton_kernels
+@@ -80,6 +84,60 @@
+ 
+     CK = 7
+ 
++    # CUTLASS SM120 grouped GEMM (vLLM native, no FlashInfer)
++    CUTLASS_FP4 = 8  # SM120/SM121: FP4 mma.sync.block_scale
++
++
++def _convert_mxfp4_to_nvfp4_scales(
++    ue8m0_scales: torch.Tensor,
++    block_size_mxfp4: int = 32,
++    block_size_nvfp4: int = 16,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Convert MXFP4 UE8M0 scales to NVFP4 UE4M3 swizzled scales.
++
++    Returns (ue4m3_swizzled, alphas) where alphas compensate for UE4M3
++    range clipping (max=448).
++    """
++    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
++        swizzle_blockscale,
++    )
++
++    assert ue8m0_scales.dtype == torch.uint8
++    orig_shape = ue8m0_scales.shape  # [E, N, K/32]
++    E = orig_shape[0]
++
++    # UE8M0 -> float: 2^(exponent - 127)
++    float_scales = torch.pow(
++        2.0, ue8m0_scales.to(torch.float32) - 127.0
++    )
++
++    # Per-expert alpha: compensate for UE4M3 range clipping (>448)
++    max_per_expert = float_scales.view(E, -1).max(dim=1).values
++    ue4m3_max = torch.tensor(448.0, device=max_per_expert.device)
++    alphas = torch.where(
++        max_per_expert > ue4m3_max,
++        max_per_expert / ue4m3_max,
++        torch.ones_like(max_per_expert),
++    )
++
++    # Scale down by alpha, then clip to UE4M3 range
++    float_scales_adj = float_scales / alphas.view(E, 1, 1)
++
++    # Block 32 -> 16: duplicate each scale for two sub-blocks
++    assert block_size_mxfp4 == 2 * block_size_nvfp4
++    ratio = block_size_mxfp4 // block_size_nvfp4
++    float_scales_16 = float_scales_adj.unsqueeze(-1).expand(
++        *float_scales_adj.shape, ratio
++    ).reshape(E, orig_shape[1], orig_shape[2] * ratio)
++
++    # Cast to float8_e4m3fn
++    ue4m3_scales = float_scales_16.to(torch.float8_e4m3fn)
++
++    # Swizzle for CUTLASS tensor core layout
++    ue4m3_swizzled = swizzle_blockscale(ue4m3_scales)
++
++    return ue4m3_swizzled, alphas
++
+ 
+ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
+     """
+@@ -111,7 +169,40 @@
+     if with_lora_support:
+         return get_mxfp4_backend_with_lora()
+ 
++    # Check VLLM_MXFP4_BACKEND env var (explicit override)
++    backend_name = envs.VLLM_MXFP4_BACKEND
++    if backend_name != "auto":
++        _BACKEND_MAP = {
++            "marlin": Mxfp4Backend.MARLIN,
++            "cutlass_fp4": Mxfp4Backend.CUTLASS_FP4,
++            "triton": Mxfp4Backend.TRITON,
++        }
++        if backend_name in _BACKEND_MAP:
++            backend = _BACKEND_MAP[backend_name]
++            logger.info_once(
++                f"[MXFP4] Using backend: {backend_name} "
++                f"(VLLM_MXFP4_BACKEND={backend_name})"
++            )
++            return backend
++        else:
++            logger.warning_once(
++                f"[MXFP4] Unknown VLLM_MXFP4_BACKEND={backend_name}, using auto"
++            )
++
+     if current_platform.is_cuda():
++        # SM12x (GB10): prefer CUTLASS_FP4 (vLLM native SM120 grouped GEMM)
++        capability = current_platform.get_device_capability()
++        is_sm12x = capability is not None and capability.major == 12
++        if is_sm12x:
++            from vllm.model_executor.layers.quantization.utils.quant_utils import (
++                cutlass_fp4_supported,
++            )
++            if cutlass_fp4_supported():
++                logger.info_once(
++                    "[MXFP4] Auto-selected: CUTLASS_FP4 "
++                    "(vLLM native SM120 FP4 grouped GEMM for SM12x)"
++                )
++                return Mxfp4Backend.CUTLASS_FP4
+         if (
+             current_platform.is_device_capability(90)
+             and has_flashinfer()
+@@ -208,25 +299,48 @@
+     def get_config_filenames(cls) -> list[str]:
+         return []
+ 
++    @staticmethod
++    def _should_skip_layer(prefix: str, ignored_layers: list[str]) -> bool:
++        """Check if prefix matches any ignored_layers pattern (fnmatch glob).
++
++        Also handles vLLM module name remapping (e.g. self_attn -> attn).
++        """
++        from fnmatch import fnmatch
++        for pattern in ignored_layers:
++            if fnmatch(prefix, pattern) or fnmatch(prefix, pattern + ".*"):
++                return True
++            # Handle vLLM's module name remapping:
++            # HF config uses "self_attn" but vLLM model uses "attn"
++            if "self_attn" in pattern:
++                alt = pattern.replace("self_attn", "attn")
++                if fnmatch(prefix, alt) or fnmatch(prefix, alt + ".*"):
++                    return True
++        return False
++
+     def get_quant_method(
+         self, layer: torch.nn.Module, prefix: str
+     ) -> "QuantizeMethodBase | None":
+         if isinstance(layer, LinearBase):
+-            if self.ignored_layers and is_layer_skipped(
+-                prefix=prefix,
+-                ignored_layers=self.ignored_layers,
+-                fused_mapping=self.packed_modules_mapping,
+-            ):
+-                return UnquantizedLinearMethod()
+-            # TODO: Add support for MXFP4 Linear Method.
+-            # MXFP4 LinearMethod is available in AMD-Quark, refer to that implementation
+-            # if you are interested in enabling MXFP4 here.
+-            logger.debug_once(
+-                "MXFP4 linear layer is not implemented - falling back to "
+-                "UnquantizedLinearMethod.",
+-                scope="local",
+-            )
+-            return UnquantizedLinearMethod()
++            if self.ignored_layers:
++                skip = self._should_skip_layer(prefix, self.ignored_layers)
++                if skip:
++                    return UnquantizedLinearMethod()
++            return Mxfp4LinearMethod()
++        elif isinstance(layer, VocabParallelEmbedding):
++            is_lm_head = prefix == "lm_head" or prefix.endswith(".lm_head")
++            if is_lm_head and current_platform.is_cuda():
++                # Check modules_to_not_convert
++                if self.ignored_layers and self._should_skip_layer(
++                    prefix, self.ignored_layers
++                ):
++                    logger.info("[MXFP4] lm_head skipped (modules_to_not_convert)")
++                    return None
++                vllm_config = get_current_vllm_config()
++                hf_config = vllm_config.model_config.hf_config
++                if getattr(hf_config, "tie_word_embeddings", False):
++                    return None
++                return Mxfp4LMHeadMethod()
++            return None
+         elif isinstance(layer, FusedMoE):
+             if current_platform.is_xpu():
+                 return XpuMxfp4MoEMethod(layer.moe_config)
+@@ -247,6 +361,269 @@
+         return True
+ 
+ 
++class Mxfp4LinearMethod(LinearMethodBase):
++    """MXFP4 online quantization for dense linear layers (qkv_proj, o_proj).
++
++    Loads BF16 weights, quantizes to FP4 in process_weights_after_loading,
++    and uses Marlin FP4 kernel for inference.
++    """
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        K = input_size_per_partition
++        N = sum(output_partition_sizes)
++
++        # Marlin alignment: K % 64 == 0, N % 128 == 0
++        K_padded = round_up(K, 64)
++        N_padded = round_up(N, 128)
++
++        layer._mxfp4_K = K
++        layer._mxfp4_N = N
++        layer._mxfp4_K_padded = K_padded
++        layer._mxfp4_N_padded = N_padded
++
++        weight_loader = extra_weight_attrs.pop("weight_loader")
++        weight = ModelWeightParameter(
++            data=torch.empty(N, K, dtype=params_dtype),
++            input_dim=1,
++            output_dim=0,
++            weight_loader=weight_loader,
++        )
++        layer.register_parameter("weight", weight)
++        set_weight_attrs(weight, extra_weight_attrs)
++
++        layer.params_dtype = params_dtype
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
++            mxfp4_e2m1_quantize,
++        )
++
++        K = layer._mxfp4_K
++        N = layer._mxfp4_N
++        K_padded = layer._mxfp4_K_padded
++        N_padded = layer._mxfp4_N_padded
++
++        weight_bf16 = layer.weight.data  # (N, K)
++
++        # Pad to Marlin alignment
++        if K_padded != K or N_padded != N:
++            padded = torch.zeros(
++                N_padded, K_padded,
++                dtype=weight_bf16.dtype, device=weight_bf16.device,
++            )
++            padded[:N, :K] = weight_bf16
++            weight_bf16 = padded
++
++        # BF16 -> FP4 quantize
++        quant, scales = mxfp4_e2m1_quantize(weight_bf16)
++        del weight_bf16
++
++        # Set attributes for prepare_fp4_layer_for_marlin
++        replace_parameter(layer, "weight", quant)
++        layer.weight_scale = Parameter(scales, requires_grad=False)
++        layer.output_size_per_partition = N_padded
++        layer.input_size_per_partition = K_padded
++
++        # Pad bias if N was padded
++        if hasattr(layer, "bias") and layer.bias is not None and N_padded != N:
++            padded_bias = torch.zeros(
++                N_padded, dtype=layer.bias.dtype, device=layer.bias.device,
++            )
++            padded_bias[:N] = layer.bias.data
++            layer.bias = Parameter(padded_bias, requires_grad=False)
++
++        prepare_fp4_layer_for_marlin(layer, input_dtype=get_marlin_input_dtype())
++        torch.cuda.empty_cache()
++
++        logger.info(
++            f"[MXFP4] Linear quantized: ({N},{K}) -> "
++            f"({N_padded},{K_padded}) FP4+Marlin"
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        K = layer._mxfp4_K
++        N = layer._mxfp4_N
++        K_padded = layer._mxfp4_K_padded
++        N_padded = layer._mxfp4_N_padded
++
++        # Pad input if K was padded
++        if K_padded != K:
++            pad = torch.zeros(
++                *x.shape[:-1], K_padded - K,
++                dtype=x.dtype, device=x.device,
++            )
++            x = torch.cat([x, pad], dim=-1)
++
++        output = apply_fp4_marlin_linear(
++            input=x,
++            weight=layer.weight,
++            weight_scale=layer.weight_scale,
++            weight_global_scale=None,
++            workspace=layer.workspace,
++            size_n=N_padded,
++            size_k=K_padded,
++            bias=bias,
++        )
++
++        # Slice output if N was padded
++        if N_padded != N:
++            output = output[..., :N].contiguous()
++
++        return output
++
++
++class Mxfp4LMHeadMethod(QuantizeMethodBase):
++    """MXFP4 online quantization for lm_head (VocabParallelEmbedding).
++
++    Same FP4 Marlin logic as Mxfp4LinearMethod but adapted for the
++    VocabParallelEmbedding create_weights/apply interface.
++    """
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        N = sum(output_partition_sizes)
++        K = input_size_per_partition
++
++        K_padded = round_up(K, 64)
++        N_padded = round_up(N, 128)
++
++        layer._mxfp4_K = K
++        layer._mxfp4_N = N
++        layer._mxfp4_K_padded = K_padded
++        layer._mxfp4_N_padded = N_padded
++        layer._mxfp4_bf16_fallback = False
++
++        weight = Parameter(
++            torch.empty(N, K, dtype=params_dtype),
++            requires_grad=False,
++        )
++        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
++        layer.register_parameter("weight", weight)
++        set_weight_attrs(weight, extra_weight_attrs)
++
++        layer.params_dtype = params_dtype
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
++            mxfp4_e2m1_quantize,
++        )
++
++        K = layer._mxfp4_K
++        N = layer._mxfp4_N
++        K_padded = layer._mxfp4_K_padded
++        N_padded = layer._mxfp4_N_padded
++
++        weight_bf16 = layer.weight.data
++
++        # Detect tied embeddings (shared with input embedding)
++        if weight_bf16.dtype not in (torch.bfloat16, torch.float16):
++            logger.warning(
++                "[MXFP4] lm_head weight dtype=%s, falling back to BF16",
++                weight_bf16.dtype,
++            )
++            layer._mxfp4_bf16_fallback = True
++            return
++
++        # Pad to Marlin alignment
++        if K_padded != K or N_padded != N:
++            padded = torch.zeros(
++                N_padded, K_padded,
++                dtype=weight_bf16.dtype, device=weight_bf16.device,
++            )
++            padded[:N, :K] = weight_bf16
++            weight_bf16 = padded
++
++        quant, scales = mxfp4_e2m1_quantize(weight_bf16)
++        del weight_bf16
++
++        replace_parameter(layer, "weight", quant)
++        layer.weight_scale = Parameter(scales, requires_grad=False)
++        layer.output_size_per_partition = N_padded
++        layer.input_size_per_partition = K_padded
++
++        prepare_fp4_layer_for_marlin(layer, input_dtype=get_marlin_input_dtype())
++        torch.cuda.empty_cache()
++
++        logger.info(
++            "[MXFP4] lm_head quantized: (%d,%d) -> (%d,%d) FP4+Marlin",
++            N, K, N_padded, K_padded,
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if layer._mxfp4_bf16_fallback:
++            return torch.nn.functional.linear(x, layer.weight, bias)
++
++        K = layer._mxfp4_K
++        N = layer._mxfp4_N
++        K_padded = layer._mxfp4_K_padded
++        N_padded = layer._mxfp4_N_padded
++
++        if K_padded != K:
++            pad = torch.zeros(
++                *x.shape[:-1], K_padded - K,
++                dtype=x.dtype, device=x.device,
++            )
++            x = torch.cat([x, pad], dim=-1)
++
++        output = apply_fp4_marlin_linear(
++            input=x,
++            weight=layer.weight,
++            weight_scale=layer.weight_scale,
++            weight_global_scale=None,
++            workspace=layer.workspace,
++            size_n=N_padded,
++            size_k=K_padded,
++            bias=bias,
++        )
++
++        if N_padded != N:
++            output = output[..., :N].contiguous()
++
++        return output
++
++    def embedding(
++        self,
++        layer: torch.nn.Module,
++        input_: torch.Tensor,
++    ) -> torch.Tensor:
++        # lm_head is never used as embedding lookup, but the interface
++        # requires it. Fall back to dense weight if needed.
++        if layer._mxfp4_bf16_fallback:
++            return torch.nn.functional.embedding(input_, layer.weight)
++        raise NotImplementedError(
++            "Mxfp4LMHeadMethod does not support embedding lookup "
++            "(FP4 weights are Marlin-packed). This method should only "
++            "be used for lm_head."
++        )
++
++
+ class Mxfp4MoEMethod(FusedMoEMethodBase):
+     """MXFP4 MoE quantization method."""
+ 
+@@ -278,8 +655,27 @@
+         **extra_weight_attrs,
+     ):
+         self.num_experts = num_experts
+-        weight_dtype = torch.uint8
+-        scale_dtype = torch.uint8
++
++        # Online quantization: store BF16 weights, quantize in
++        # process_weights_after_loading (needed for non-prequantized models)
++        # Detect pre-quantized models via HF config quantization_config
++        vllm_config = get_current_vllm_config()
++        hf_quant_config = getattr(
++            vllm_config.model_config.hf_config,
++            'quantization_config', None)
++        is_prequantized = hf_quant_config is not None
++        self._online_quant = (
++            not is_prequantized
++            and self.mxfp4_backend in (
++                Mxfp4Backend.CUTLASS_FP4, Mxfp4Backend.MARLIN,
++            )
++        )
++        if self._online_quant:
++            weight_dtype = params_dtype  # BF16
++            scale_dtype = torch.uint8  # placeholder, replaced later
++        else:
++            weight_dtype = torch.uint8
++            scale_dtype = torch.uint8
+ 
+         # FIXME (zyongye): ship after torch and safetensors support mxfp4
+         # is_torch_mxfp4_available = (
+@@ -329,6 +725,7 @@
+         elif (
+             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+             or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
++            or self.mxfp4_backend == Mxfp4Backend.CUTLASS_FP4
+         ):
+             intermediate_size_per_partition_after_pad = round_up(
+                 intermediate_size_per_partition, 128
+@@ -351,12 +748,18 @@
+         self.intermediate_pad = (
+             intermediate_size_per_partition_after_pad - intermediate_size_per_partition
+         )
++        # Weight dimension: BF16 uses full K, packed MXFP4 uses K/2
++        w13_k = hidden_size if self._online_quant else hidden_size // 2
++        w2_k = (intermediate_size_per_partition_after_pad
++                if self._online_quant
++                else intermediate_size_per_partition_after_pad // 2)
++
+         # Fused gate_up_proj (column parallel)
+         w13_weight = torch.nn.Parameter(
+             torch.zeros(
+                 num_experts,
+                 2 * intermediate_size_per_partition_after_pad,
+-                hidden_size // 2,
++                w13_k,
+                 dtype=weight_dtype,
+             ),
+             requires_grad=False,
+@@ -392,7 +795,7 @@
+             torch.zeros(
+                 num_experts,
+                 hidden_size,
+-                intermediate_size_per_partition_after_pad // 2,
++                w2_k,
+                 dtype=weight_dtype,
+             ),
+             requires_grad=False,
+@@ -423,8 +826,35 @@
+         layer.register_parameter("w2_bias", w2_bias)
+         set_weight_attrs(w2_bias, extra_weight_attrs)
+ 
++    def _quantize_bf16_to_mxfp4(self, layer):
++        """Convert BF16 weights to MXFP4 packed format in-place."""
++        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
++            mxfp4_e2m1_quantize,
++        )
++        for wname, sname in [("w13_weight", "w13_weight_scale"),
++                              ("w2_weight", "w2_weight_scale")]:
++            bf16 = getattr(layer, wname).data
++            if bf16.dtype != torch.bfloat16:
++                return  # already packed
++            E = bf16.shape[0]
++            q0, s0 = mxfp4_e2m1_quantize(bf16[0])
++            quant = torch.empty(E, *q0.shape, dtype=q0.dtype, device=q0.device)
++            scales = torch.empty(E, *s0.shape, dtype=s0.dtype, device=s0.device)
++            quant[0].copy_(q0)
++            scales[0].copy_(s0)
++            for i in range(1, E):
++                q, s = mxfp4_e2m1_quantize(bf16[i])
++                quant[i].copy_(q)
++                scales[i].copy_(s)
++            setattr(layer, wname, Parameter(quant, requires_grad=False))
++            setattr(layer, sname, Parameter(scales, requires_grad=False))
++        del bf16
++        torch.cuda.empty_cache()
++
+     def process_weights_after_loading(self, layer):
+         if self.mxfp4_backend == Mxfp4Backend.MARLIN:
++            if self._online_quant:
++                self._quantize_bf16_to_mxfp4(layer)
+             prepare_moe_fp4_layer_for_marlin(
+                 layer, input_dtype=get_marlin_input_dtype()
+             )
+@@ -857,6 +1287,132 @@
+             # replace_parameter(layer, "w13_weight", w13_weight)
+             # replace_parameter(layer, "w2_weight", w2_weight)
+ 
++        elif self.mxfp4_backend == Mxfp4Backend.CUTLASS_FP4:
++            from vllm.model_executor.layers.fused_moe.config import (
++                nvfp4_moe_quant_config,
++            )
++            from vllm.model_executor.layers.fused_moe.cutlass_moe import (
++                CutlassExpertsFp4,
++            )
++
++            if self._online_quant:
++                # Step 1: BF16 -> MXFP4 (E2M1 + UE8M0)
++                from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
++                    mxfp4_e2m1_quantize,
++                )
++                w13_bf16 = layer.w13_weight.data
++                w2_bf16 = layer.w2_weight.data
++                E = w13_bf16.shape[0]
++
++                q0, s0 = mxfp4_e2m1_quantize(w13_bf16[0])
++                w13_quant = torch.empty(
++                    E, q0.shape[0], q0.shape[1],
++                    dtype=q0.dtype, device=q0.device)
++                w13_scales = torch.empty(
++                    E, s0.shape[0], s0.shape[1],
++                    dtype=s0.dtype, device=s0.device)
++                w13_quant[0].copy_(q0)
++                w13_scales[0].copy_(s0)
++                del q0, s0
++
++                q0, s0 = mxfp4_e2m1_quantize(w2_bf16[0])
++                w2_quant = torch.empty(
++                    E, q0.shape[0], q0.shape[1],
++                    dtype=q0.dtype, device=q0.device)
++                w2_scales = torch.empty(
++                    E, s0.shape[0], s0.shape[1],
++                    dtype=s0.dtype, device=s0.device)
++                w2_quant[0].copy_(q0)
++                w2_scales[0].copy_(s0)
++                del q0, s0
++
++                for i in range(1, E):
++                    q, s = mxfp4_e2m1_quantize(w13_bf16[i])
++                    w13_quant[i].copy_(q)
++                    w13_scales[i].copy_(s)
++                    q, s = mxfp4_e2m1_quantize(w2_bf16[i])
++                    w2_quant[i].copy_(q)
++                    w2_scales[i].copy_(s)
++                del q, s
++
++                logger.info(
++                    f"Online quant BF16->NVFP4: w13 {list(w13_bf16.shape)}->"
++                    f"{list(w13_quant.shape)}, w2 {list(w2_bf16.shape)}->"
++                    f"{list(w2_quant.shape)} ({E} experts)"
++                )
++
++                layer.w13_weight = Parameter(w13_quant, requires_grad=False)
++                layer.w2_weight = Parameter(w2_quant, requires_grad=False)
++                layer.w13_weight_scale = Parameter(
++                    w13_scales, requires_grad=False)
++                layer.w2_weight_scale = Parameter(
++                    w2_scales, requires_grad=False)
++                del w13_bf16, w2_bf16, w13_quant, w2_quant
++                del w13_scales, w2_scales
++                torch.cuda.empty_cache()
++
++            # Step 2: Convert MXFP4 scales to NVFP4 (UE8M0 -> UE4M3 swizzled)
++            w13_bs_swizzled, w13_alphas = _convert_mxfp4_to_nvfp4_scales(
++                layer.w13_weight_scale.data
++            )
++            w2_bs_swizzled, w2_alphas = _convert_mxfp4_to_nvfp4_scales(
++                layer.w2_weight_scale.data
++            )
++
++            # Store converted scales
++            layer.w13_weight_scale = Parameter(
++                w13_bs_swizzled, requires_grad=False
++            )
++            layer.w2_weight_scale = Parameter(
++                w2_bs_swizzled, requires_grad=False
++            )
++
++            # Per-expert alphas and activation global scales
++            layer.w13_alphas = Parameter(
++                w13_alphas.to(torch.float32).cuda(), requires_grad=False
++            )
++            layer.w2_alphas = Parameter(
++                w2_alphas.to(torch.float32).cuda(), requires_grad=False
++            )
++            layer.a1_gscale = Parameter(
++                torch.ones(self.num_experts, dtype=torch.float32).cuda(),
++                requires_grad=False,
++            )
++            layer.a2_gscale = Parameter(
++                torch.ones(self.num_experts, dtype=torch.float32).cuda(),
++                requires_grad=False,
++            )
++
++            self.moe_quant_config = nvfp4_moe_quant_config(
++                g1_alphas=layer.w13_alphas.data,
++                g2_alphas=layer.w2_alphas.data,
++                a1_gscale=layer.a1_gscale.data,
++                a2_gscale=layer.a2_gscale.data,
++                w1_scale=layer.w13_weight_scale.data,
++                w2_scale=layer.w2_weight_scale.data,
++                w1_bias=getattr(layer, 'w13_bias', None),
++                w2_bias=getattr(layer, 'w2_bias', None),
++            )
++            assert self.moe_quant_config is not None
++
++            prepare_finalize = maybe_make_prepare_finalize(
++                moe=self.moe,
++                quant_config=self.moe_quant_config,
++                routing_tables=layer._maybe_init_expert_routing_tables(),
++                allow_new_interface=True,
++            )
++            assert prepare_finalize is not None
++
++            self.moe_kernel = mk.FusedMoEKernel(
++                prepare_finalize,
++                CutlassExpertsFp4(
++                    moe_config=self.moe,
++                    quant_config=self.moe_quant_config,
++                ),
++                inplace=not self.moe.disable_inplace,
++                shared_experts=None,
++            )
++
+         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
+             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+ 
+@@ -920,6 +1476,11 @@
+                 w1_scale=w1_scale,
+                 w2_scale=w2_scale,
+             )
++        elif self.mxfp4_backend == Mxfp4Backend.CUTLASS_FP4:
++            from vllm.model_executor.layers.fused_moe.config import (
++                nvfp4_moe_quant_config,
++            )
++            return nvfp4_moe_quant_config()
+         elif self.mxfp4_backend in [
+             Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM,
+             Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS,
+@@ -994,6 +1555,14 @@
+                 if self.moe.is_lora_enabled:
+                     return UnfusedOAITritonExperts(self.moe, self.moe_quant_config)
+                 return OAITritonExperts(self.moe, self.moe_quant_config)
++            elif self.mxfp4_backend == Mxfp4Backend.CUTLASS_FP4:
++                from vllm.model_executor.layers.fused_moe.cutlass_moe import (
++                    CutlassExpertsFp4,
++                )
++                return CutlassExpertsFp4(
++                    moe_config=self.moe,
++                    quant_config=self.moe_quant_config,
++                )
+             else:
+                 raise NotImplementedError(
+                     f"Incompatible Mxfp4 backend ({self.mxfp4_backend}) for EP"
+@@ -1022,25 +1591,30 @@
+         if layer.enable_eplb:
+             raise NotImplementedError("EPLB is not supported for mxfp4")
+ 
+-        assert _can_support_mxfp4(
+-            layer.use_grouped_topk,
+-            layer.topk_group,
+-            layer.num_expert_group,
+-            layer.expert_map,
+-            layer.custom_routing_function,
+-            layer.e_score_correction_bias,
+-            layer.apply_router_weight_on_input,
+-            layer.scoring_func,
+-            layer.activation,
+-            layer.eplb_state.expert_load_view,
+-            layer.eplb_state.logical_to_physical_map,
+-            layer.eplb_state.logical_replica_count,
+-        ), "MXFP4 are not supported with this configuration."
++        # Non-monolithic backends handle expert_map via prepare/finalize
++        if self.mxfp4_backend not in (
++            Mxfp4Backend.CUTLASS_FP4, Mxfp4Backend.MARLIN,
++        ):
++            assert _can_support_mxfp4(
++                layer.use_grouped_topk,
++                layer.topk_group,
++                layer.num_expert_group,
++                layer.expert_map,
++                layer.custom_routing_function,
++                layer.e_score_correction_bias,
++                layer.apply_router_weight_on_input,
++                layer.scoring_func,
++                layer.activation,
++                layer.eplb_state.expert_load_view,
++                layer.eplb_state.logical_to_physical_map,
++                layer.eplb_state.logical_replica_count,
++            ), "MXFP4 are not supported with this configuration."
+ 
+         assert (
+             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+             or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
+             or self.mxfp4_backend == Mxfp4Backend.MARLIN
++            or self.mxfp4_backend == Mxfp4Backend.CUTLASS_FP4
+         )
+ 
+         assert self.moe_kernel is not None
+--- vllm/model_executor/layers/fused_moe/layer.py	2026-03-09 02:10:13.778327462 +0900
++++ vllm/model_executor/layers/fused_moe/layer.py	2026-03-09 00:29:44.597657650 +0900
+@@ -257,6 +257,7 @@
+         if (
+             current_mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
+             or current_mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
++            or current_mxfp4_backend == Mxfp4Backend.CUTLASS_FP4
+         ):
+             hidden_size = round_up(hidden_size, 128)
+         elif (
+@@ -1067,14 +1068,21 @@
+     ) -> bool | None:
+         if self.quant_config and self.quant_config.get_name() == "mxfp4":
+             # (FIXME) for gpt-oss all experts are combined
+-            if "bias" in weight_name:
++            # Skip this path for BF16 online quantization (weights are 2D per-expert)
++            if loaded_weight.ndim >= 3:
++                if "bias" in weight_name:
++                    dim1 = loaded_weight.shape[1]
++                    param.data[:, :dim1].copy_(loaded_weight)
++                else:
++                    dim1 = loaded_weight.shape[1]
++                    dim2 = loaded_weight.shape[2]
++                    param.data[:, :dim1, :dim2].copy_(loaded_weight)
++                return True if return_success else None
++            elif shard_id is None:
++                # gpt-oss 2D bias [E, N] with shard_id=None
+                 dim1 = loaded_weight.shape[1]
+                 param.data[:, :dim1].copy_(loaded_weight)
+-            else:
+-                dim1 = loaded_weight.shape[1]
+-                dim2 = loaded_weight.shape[2]
+-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+-            return True if return_success else None
++                return True if return_success else None
+ 
+         quant_method_name = self.quant_method.__class__.__name__
+         global_expert_id = expert_id
+--- vllm/model_executor/layers/fused_moe/cutlass_moe.py	2026-03-09 02:10:13.777257014 +0900
++++ vllm/model_executor/layers/fused_moe/cutlass_moe.py	2026-03-09 00:32:12.397685697 +0900
+@@ -505,6 +505,8 @@
+     e: int,
+     device: torch.device,
+     apply_router_weight_on_input: bool = False,
++    bias1: torch.Tensor | None = None,
++    bias2: torch.Tensor | None = None,
+ ) -> None:
+     """
+     MoE implementation for FP4 Inputs
+@@ -619,6 +621,15 @@
+         blockscale_offsets[:-1],
+     )
+     del rep_a_fp4, rep_a_blockscale
++
++    if bias1 is not None or bias2 is not None:
++        # CUDAGraph-safe: bucketize produces fixed-shape output
++        row_indices = torch.arange(m * topk, device=device, dtype=torch.int32)
++        expert_ids = torch.bucketize(row_indices, expert_offsets[1:e])
++
++    if bias1 is not None:
++        c1 += bias1[expert_ids]
++
+     if activation == MoEActivation.SILU:
+         # Fused SiLU+Mul+NVFP4 quantization
+         # Note: c2 workspace is no longer needed since SiLU is fused with quantization.
+@@ -645,6 +656,9 @@
+     )
+     del int_fp4, int_blockscale
+ 
++    if bias2 is not None:
++        c3 += bias2[expert_ids]
++
+     c3 = ops.shuffle_rows(c3, c_map)
+ 
+     assert output.dtype == out_dtype
+@@ -702,16 +716,19 @@
+ 
+     @staticmethod
+     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+-        # CutlassExpertsFp4 does not support expert map, which is
+-        # needed for STANDARD activation format kernels in EP mode.
+-        return moe_parallel_config.ep_size == 1
++        # Allow EP>1: non-monolithic path handles routing/permute in Python.
++        # Kernel only sees local experts.
++        return not (
++            moe_parallel_config.use_fi_all2allv_kernels
++            or moe_parallel_config.use_deepep_ht_kernels
++        )
+ 
+     @staticmethod
+     def activation_format() -> mk.FusedMoEActivationFormat:
+         return mk.FusedMoEActivationFormat.Standard
+ 
+     def supports_expert_map(self) -> bool:
+-        return False
++        return True
+ 
+     def supports_chunking(self) -> bool:
+         return True
+@@ -781,6 +798,8 @@
+             e=e,
+             device=hidden_states.device,
+             apply_router_weight_on_input=apply_router_weight_on_input,
++            bias1=self.w1_bias,
++            bias2=self.w2_bias,
+         )
+ 
+ 
+@@ -1186,6 +1205,7 @@
+             quant_config=quant_config,
+             group_size=group_size,
+         ),
++        inplace=False,
+     )
+ 
+     return fn.apply(
+--- /dev/null	2026-03-02 23:18:34.865195152 +0900
++++ vllm/model_executor/layers/fused_moe/routing_simulator.py	2026-03-09 00:29:44.602648599 +0900
+@@ -0,0 +1,310 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++Token-to-Expert Routing Simulator
++
++This module provides a framework for simulating and testing different
++token-to-expert routing strategies for Mixture of Experts (MoE) models.
++It supports routing logic customization and includes example implementations
++like uniform random routing.
++"""
++
++from abc import ABC, abstractmethod
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++class RoutingStrategy(ABC):
++    """Base class for token-to-expert routing strategies."""
++
++    @abstractmethod
++    def route_tokens(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        top_k: int,
++        indices_type: torch.dtype | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """
++        Route tokens to experts.
++
++        Args:
++            hidden_states: Input hidden states [num_tokens, hidden_size]
++            router_logits: Router logits [num_tokens, num_experts]
++            top_k: Number of experts to select per token
++            indices_type: Data type for expert indices
++
++        Returns:
++            tuple of (topk_weights, topk_ids)
++        """
++        pass
++
++
++class DistributionBasedRouting(RoutingStrategy):
++    """
++    Distribution-based random routing strategy with configurable distributions.
++
++    This routing strategy randomly selects experts for each token based on
++    different probability distributions. Currently supports uniform and normal
++    distributions for testing different routing patterns.
++    """
++
++    def __init__(self, distribution: str = "uniform", **distribution_params: Any):
++        """
++        Initialize distribution-based routing.
++
++        Args:
++            distribution: Type of distribution to use for sampling
++                - "uniform": Uniform distribution (default)
++                - "normal": Normal/Gaussian distribution
++            **distribution_params: Parameters specific to the
++                chosen distribution
++                For "uniform": No additional parameters needed
++                For "normal": mean (default: 0.0), std (default: 1.0)
++        """
++        self.distribution = distribution.lower()
++        self.distribution_params = distribution_params
++
++        # Validate distribution and parameters
++        self._validate_distribution_params()
++
++    def _validate_distribution_params(self):
++        """Validate distribution type and parameters."""
++        valid_distributions = ["uniform", "normal"]
++
++        if self.distribution not in valid_distributions:
++            raise ValueError(
++                f"Unsupported distribution: {self.distribution}. "
++                f"Supported distributions: {valid_distributions}"
++            )
++
++        # Set default parameters if not provided
++        if self.distribution == "normal":
++            self.distribution_params.setdefault("mean", 0.0)
++            self.distribution_params.setdefault("std", 1.0)
++
++    def route_tokens(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        top_k: int,
++        indices_type: torch.dtype | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """
++        Randomly select experts for each token using the specified distribution.
++
++        Args:
++            hidden_states: Input hidden states [num_tokens, hidden_size]
++            router_logits: Router logits [num_tokens, num_experts]
++            top_k: Number of experts to select per token
++            indices_type: Data type for expert indices
++
++        Returns:
++            tuple of (topk_weights, topk_ids) where:
++            - topk_weights: Weights based on distribution sampling
++            - topk_ids: Expert indices sampled from the distribution
++        """
++        num_tokens = hidden_states.shape[0]
++        num_experts = router_logits.shape[-1]
++
++        if indices_type is None:
++            indices_type = torch.long
++
++        # Generate expert IDs based on the specified distribution
++        topk_ids = self._sample_expert_ids(
++            num_tokens, num_experts, top_k, hidden_states.device, indices_type
++        )
++
++        # Generate weights based on the distribution
++        topk_weights = self._generate_weights(num_tokens, top_k, hidden_states.device)
++
++        return topk_weights, topk_ids
++
++    def _sample_expert_ids(
++        self,
++        num_tokens: int,
++        num_experts: int,
++        top_k: int,
++        device: torch.device,
++        indices_type: torch.dtype,
++    ) -> torch.Tensor:
++        """Sample expert IDs based on the specified distribution."""
++
++        if self.distribution == "uniform":
++            # Uniform random sampling
++            return torch.randint(
++                low=0,
++                high=num_experts,
++                size=(num_tokens, top_k),
++                dtype=indices_type,
++                device=device,
++            )
++
++        elif self.distribution == "normal":
++            # For normal distribution, sample continuous values and map to
++            # expert IDs
++            continuous_samples = self._sample_continuous_distribution(
++                num_tokens, top_k, device
++            )
++
++            # Map continuous samples to expert indices
++            # Normalize to [0, 1] range and scale to [0, num_experts)
++            normalized_samples = self._normalize_samples(continuous_samples)
++            expert_ids = (normalized_samples * num_experts).long()
++            expert_ids = torch.clamp(expert_ids, 0, num_experts - 1)
++
++            return expert_ids.to(dtype=indices_type)
++
++        else:
++            raise ValueError(f"Unsupported distribution: {self.distribution}")
++
++    def _sample_continuous_distribution(
++        self, num_tokens: int, top_k: int, device: torch.device
++    ) -> torch.Tensor:
++        """Sample from continuous distributions."""
++        shape = (num_tokens, top_k)
++
++        if self.distribution == "normal":
++            mean = self.distribution_params["mean"]
++            std = self.distribution_params["std"]
++            return torch.normal(mean, std, size=shape, device=device)
++
++        else:
++            raise ValueError(
++                f"Unsupported continuous distribution: {self.distribution}"
++            )
++
++    def _normalize_samples(self, samples: torch.Tensor) -> torch.Tensor:
++        """Normalize samples to [0, 1] range."""
++        if self.distribution == "normal":
++            # Use sigmoid to map normal distribution to [0, 1]
++            return torch.sigmoid(samples)
++
++        else:
++            raise ValueError(
++                f"Unsupported distribution for normalization: {self.distribution}"
++            )
++
++    def _generate_weights(
++        self, num_tokens: int, top_k: int, device: torch.device
++    ) -> torch.Tensor:
++        """Generate weights based on the distribution."""
++        if self.distribution == "uniform":
++            # All-ones weights for uniform distribution
++            return torch.ones(
++                (num_tokens, top_k),
++                dtype=torch.float32,
++                device=device,
++            )
++
++        elif self.distribution == "normal":
++            # For normal distribution, generate weights from the same
++            # distribution
++            continuous_weights = self._sample_continuous_distribution(
++                num_tokens, top_k, device
++            )
++            # Normalize to positive values and sum to 1
++            weights = torch.abs(continuous_weights)
++            weights = weights / weights.sum(dim=-1, keepdim=True)
++            return weights
++
++        else:
++            raise ValueError(
++                f"Unsupported distribution for weight generation: {self.distribution}"
++            )
++
++    def get_distribution_info(self) -> dict:
++        """Get information about the current distribution configuration."""
++        return {
++            "distribution": self.distribution,
++            "parameters": self.distribution_params.copy(),
++        }
++
++
++class RoutingSimulator:
++    """
++    Token-to-Expert Routing Simulator.
++
++    This class provides a framework for testing and comparing different
++    routing strategies for MoE models. It can simulate routing behavior
++    and collect statistics for analysis.
++    """
++
++    # Class-level registry of routing strategies
++    _routing_strategies: dict[str, RoutingStrategy] = {
++        # Basic routing strategies
++        "uniform_random": DistributionBasedRouting(
++            distribution="uniform", mean=0.0, std=1.0
++        ),
++        "normal_routing": DistributionBasedRouting(
++            distribution="normal", mean=0.0, std=1.0
++        ),
++    }
++
++    @classmethod
++    def register_strategy(cls, name: str, strategy: RoutingStrategy):
++        """
++        Register a custom routing strategy.
++
++        Args:
++            name: Name of the strategy
++            strategy: RoutingStrategy instance
++        """
++        cls._routing_strategies[name] = strategy
++
++    @classmethod
++    def get_available_strategies(cls) -> list[str]:
++        """
++        Get list of available routing strategy names.
++
++        Returns:
++            List of available strategy names
++        """
++        return list(cls._routing_strategies.keys())
++
++    @staticmethod
++    def simulate_routing(
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        strategy_name: str,
++        top_k: int,
++        indices_type: torch.dtype | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """
++        Simulate token-to-expert routing using the specified strategy.
++
++        Args:
++            hidden_states: Input hidden states [num_tokens, hidden_size]
++            router_logits: Router logits [num_tokens, num_experts]
++            strategy_name: Name of the routing strategy to use
++            top_k: Number of experts to select per token
++            indices_type: Data type for expert indices
++
++        Returns:
++            tuple of (topk_weights, topk_ids)
++        """
++        if strategy_name not in RoutingSimulator._routing_strategies:
++            raise ValueError(
++                f"Unknown routing strategy: {strategy_name}. "
++                f"Available strategies: "
++                f"{list(RoutingSimulator._routing_strategies.keys())}"
++            )
++        logger.warning_once(
++            "Simulating MoE routing using a %s strategy. "
++            "This should only be used for performance testing. "
++            "Model outputs will not be valid.",
++            strategy_name,
++        )
++
++        strategy = RoutingSimulator._routing_strategies[strategy_name]
++        return strategy.route_tokens(
++            hidden_states=hidden_states,
++            router_logits=router_logits,
++            top_k=top_k,
++            indices_type=indices_type,
++        )
+--- vllm/model_executor/layers/fla/ops/fused_recurrent.py	2026-03-09 02:10:13.776407430 +0900
++++ vllm/model_executor/layers/fla/ops/fused_recurrent.py	2026-03-09 00:29:44.599468848 +0900
+@@ -192,11 +192,12 @@
+     B, T, H, K, V = *k.shape, v.shape[-1]
+     HV = v.shape[2]
+     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
++    BK = triton.next_power_of_2(K)
++    BV = triton.next_power_of_2(V)  # was: min(..., 32)
+     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+     assert NK == 1, "NK > 1 is not supported yet"
+     num_stages = 3
+-    num_warps = 1
++    num_warps = 4  # was: 1
+ 
+     o = q.new_empty(NK, *v.shape)
+     if inplace_final_state:
+--- vllm/model_executor/models/gpt_oss.py	2026-03-09 02:10:13.811835624 +0900
++++ vllm/model_executor/models/gpt_oss.py	2026-03-09 00:29:44.600796650 +0900
+@@ -971,6 +971,34 @@
+                 loaded_params.add(name)
+         return loaded_params
+ 
++    @staticmethod
++    def _quantize_moe_weight_mxfp4(
++        param: torch.nn.Parameter,
++        scale_param: torch.nn.Parameter,
++        bf16_weight: torch.Tensor,
++    ) -> None:
++        """Quantize bf16 MoE weight to MXFP4 for online quantization."""
++        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
++            mxfp4_e2m1_quantize,
++        )
++
++        E = bf16_weight.shape[0]
++        target_n = param.shape[1]
++        target_k_padded = param.shape[2] * 2
++
++        pad_n = target_n - bf16_weight.shape[1]
++        pad_k = target_k_padded - bf16_weight.shape[2]
++        if pad_n > 0 or pad_k > 0:
++            bf16_weight = torch.nn.functional.pad(
++                bf16_weight, (0, pad_k, 0, pad_n))
++
++        bf16_weight = bf16_weight.to(device=param.device)
++
++        for e in range(E):
++            weight_fp4, weight_scale = mxfp4_e2m1_quantize(bf16_weight[e])
++            param.data[e].copy_(weight_fp4)
++            scale_param.data[e].copy_(weight_scale)
++
+     def _load_weights_other(
+         self,
+         ep_rank_end: int,
+@@ -1017,7 +1045,15 @@
+                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
+                 param = params_dict[name]
+ 
+-                param.copy_(narrow_weight)
++                if param.dtype == torch.uint8 and narrow_weight.dtype != torch.uint8:
++                    # Online MXFP4: quantize bf16 weight and fill scales
++                    scale_name = name + "_scale"
++                    scale_param = params_dict[scale_name]
++                    self._quantize_moe_weight_mxfp4(
++                        param, scale_param, narrow_weight)
++                    loaded_params.add(scale_name)
++                else:
++                    param.copy_(narrow_weight)
+                 loaded_params.add(name)
+                 continue
+             elif ".w2_weight" in name:
+@@ -1029,7 +1065,15 @@
+                 narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
+                 param = params_dict[name]
+ 
+-                param.copy_(narrow_weight)
++                if param.dtype == torch.uint8 and narrow_weight.dtype != torch.uint8:
++                    # Online MXFP4: quantize bf16 weight and fill scales
++                    scale_name = name + "_scale"
++                    scale_param = params_dict[scale_name]
++                    self._quantize_moe_weight_mxfp4(
++                        param, scale_param, narrow_weight)
++                    loaded_params.add(scale_name)
++                else:
++                    param.copy_(narrow_weight)
+                 loaded_params.add(name)
+                 continue
+             elif ".w13_bias" in name:
+@@ -1041,6 +1085,12 @@
+                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
+ 
+                 param = params_dict[name]
++                if param.shape != narrow_weight.shape:
++                    # MXFP4 alignment padding: zero-pad to match param shape
++                    padded = torch.zeros_like(param)
++                    padded[:narrow_weight.shape[0],
++                           :narrow_weight.shape[1]] = narrow_weight
++                    narrow_weight = padded
+                 param.copy_(narrow_weight)
+                 loaded_params.add(name)
+                 continue
+@@ -1053,6 +1103,11 @@
+                     if tp_rank != 0:
+                         weight.zero_()
+                 param = params_dict[name]
++                if param.shape != weight.shape:
++                    # MXFP4 alignment padding: zero-pad to match param shape
++                    padded = torch.zeros_like(param)
++                    padded[:weight.shape[0]] = weight
++                    weight = padded
+                 param.copy_(weight)
+                 loaded_params.add(name)
+                 continue
+@@ -1190,6 +1245,7 @@
+         self.lm_head = ParallelLMHead(
+             self.config.vocab_size,
+             self.config.hidden_size,
++            quant_config=vllm_config.quant_config,
+             prefix=maybe_prefix(prefix, "lm_head"),
+         )
+         self.logits_processor = LogitsProcessor(self.config.vocab_size)

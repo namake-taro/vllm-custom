@@ -1,0 +1,33 @@
+--- flashinfer/data/cutlass/include/cutlass/gemm/collective/sm100_blockscaled_mma_array_warpspecialized.hpp.orig
++++ flashinfer/data/cutlass/include/cutlass/gemm/collective/sm100_blockscaled_mma_array_warpspecialized.hpp
+@@ -447,7 +447,7 @@
+       stride_a = InternalStrideA{};
+       stride_b = InternalStrideB{};
+       layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(init_M, init_N, init_K, 1));
+-      layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(init_M, init_N, init_K, 1));
++      layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(init_M, init_N, init_K, 1));
+     }
+     else {
+       // Tensor shapes for Ptr-Array are initialized correctly only here.
+--- flashinfer/data/cutlass/include/cutlass/gemm/collective/sm103_blockscaled_mma_array_warpspecialized.hpp.orig
++++ flashinfer/data/cutlass/include/cutlass/gemm/collective/sm103_blockscaled_mma_array_warpspecialized.hpp
+@@ -452,7 +452,7 @@
+       stride_a = InternalStrideA{};
+       stride_b = InternalStrideB{};
+       layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(init_M, init_N, init_K, 1));
+-      layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(init_M, init_N, init_K, 1));
++      layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(init_M, init_N, init_K, 1));
+     }
+     else {
+       // Tensor shapes for Ptr-Array are initialized correctly only here.
+--- flashinfer/data/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp.orig
++++ flashinfer/data/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp
+@@ -373,7 +373,7 @@
+       stride_a = InternalStrideA{};
+       stride_b = InternalStrideB{};
+       layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(init_M, init_N, init_K, 1));
+-      layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(init_M, init_N, init_K, 1));
++      layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(init_M, init_N, init_K, 1));
+     }
+     else {
+       // Tensor shapes for Ptr-Array are initialized correctly only here.
