@@ -50,8 +50,11 @@ Custom applies BF16 -> MXFP4 online quantization via Marlin backend.
 MXFP4 pre-quantized checkpoint. Both Vanilla and Custom use MXFP4 for MoE experts.
 Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
 
-> **Note:** Vanilla TP=1 produces garbage output on GB10 due to SM121 MXFP4 Marlin kernel issues.
-> Custom TP=1 works correctly with the patches applied.
+> **Note:** Both Vanilla and Custom TP=1 produce malformed output for chat completions
+> (Harmony protocol structured tokens are corrupted, likely due to FP4 quantization errors).
+> Basic text completion (`/v1/completions`) works, but `/v1/chat/completions` does not.
+> TP=2 is required for correct chat output. The TP=1 benchmark numbers below reflect
+> throughput only (`vllm bench serve` does not validate output quality).
 
 #### Single Request (num-prompts=1)
 
@@ -59,7 +62,7 @@ Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
 |---|---|---|---|---|
 | Vanilla MXFP4 TP=1 | - | - (broken) | - | - |
 | Vanilla MXFP4 TP=2 | 19.04 | 51.82 | 51.63 | baseline |
-| **Custom MXFP4 TP=1** | **15.45** | **63.38** | **57.79** | **+22%** |
+| Custom MXFP4 TP=1 ⚠️ | 15.45 | 63.38 | 57.79 | +22% |
 | **Custom MXFP4 TP=2** | **12.08** | **80.88** | **47.39** | **+56%** |
 
 #### 10 Concurrent Requests (num-prompts=10)
@@ -67,7 +70,7 @@ Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
 | Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
 |---|---|---|---|
 | Vanilla MXFP4 TP=2 | 45.79 | 175.26 | 1482.16 |
-| **Custom MXFP4 TP=1** | **39.85** | **185.09** | **1850.86** |
+| Custom MXFP4 TP=1 ⚠️ | 39.85 | 185.09 | 1850.86 |
 | **Custom MXFP4 TP=2** | **38.04** | **201.00** | **1529.38** |
 
 #### 100 Concurrent Requests (num-prompts=100)
@@ -75,7 +78,7 @@ Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
 | Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
 |---|---|---|---|
 | Vanilla MXFP4 TP=2 | 57.33 | 220.44 | 25395.58 |
-| **Custom MXFP4 TP=1** | **59.16** | **212.51** | **26134.13** |
+| Custom MXFP4 TP=1 ⚠️ | 59.16 | 212.51 | 26134.13 |
 | **Custom MXFP4 TP=2** | **47.72** | **250.17** | **22517.78** |
 
 ### Summary
