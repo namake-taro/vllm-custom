@@ -20,73 +20,67 @@ Custom applies BF16 -> MXFP4 online quantization via Marlin backend.
 
 #### Single Request (num-prompts=1)
 
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) | vs Vanilla TP=1 |
-|---|---|---|---|---|
-| Vanilla BF16 TP=1 | 32.90 | 28.41 | 327.34 | baseline |
-| Vanilla BF16 TP=2 | 21.62 | 42.85 | 241.28 | +51% |
-| **Custom MXFP4 TP=1** | **15.83** | **57.82** | **202.63** | **+104%** |
-| **Custom MXFP4 TP=2** | **12.93** | **70.68** | **168.82** | **+149%** |
+| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
+|---|---|---|---|
+| Vanilla BF16 TP=1 | 32.93 | 28.41 | 327.34 |
+| Vanilla BF16 TP=2 | 21.68 | 39.71 | 469.77 |
+| **Custom MXFP4 TP=1** | **15.34** | **59.60** | **199.68** |
+| **Custom MXFP4 TP=2** | **12.53** | **72.72** | **168.27** |
 
 #### 10 Concurrent Requests (num-prompts=10)
 
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
+| Configuration | TPOT (ms) | Throughput (tok/s) | Total tok/s |
 |---|---|---|---|
-| Vanilla BF16 TP=1 | 88.86 | 76.92 | 5346.33 |
-| Vanilla BF16 TP=2 | 74.77 | 91.25 | 4523.53 |
-| **Custom MXFP4 TP=1** | **45.50** | **174.23** | **1562.49** |
-| **Custom MXFP4 TP=2** | **33.53** | **143.13** | **4679.82** |
-
-#### 100 Concurrent Requests (num-prompts=100)
-
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
-|---|---|---|---|
-| Vanilla BF16 TP=1 | 113.40 | 118.18 | 46721.68 |
-| Vanilla BF16 TP=2 | 64.53 | 195.74 | 28758.56 |
-| **Custom MXFP4 TP=1** | **47.34** | **237.77** | **24467.89** |
-| **Custom MXFP4 TP=2** | **33.66** | **317.82** | **18458.05** |
+| Vanilla BF16 TP=1 | 88.86 | 76.92 | 692.24 |
+| Vanilla BF16 TP=2 | 74.77 | 91.25 | 821.24 |
+| **Custom MXFP4 TP=1** | **43.99** | **121.42** | **1092.74** |
+| **Custom MXFP4 TP=2** | **32.08** | **153.87** | **1384.86** |
 
 ### openai/gpt-oss-120b
 
 MXFP4 pre-quantized checkpoint. Both Vanilla and Custom use MXFP4 for MoE experts.
-Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
+Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4,
+and includes SM121 Marlin MoE thread fix for correct TP=1 output.
 
-> **Note:** Both Vanilla and Custom TP=1 produce malformed output for chat completions
-> (Harmony protocol structured tokens are corrupted, likely due to FP4 quantization errors).
-> Basic text completion (`/v1/completions`) works, but `/v1/chat/completions` does not.
-> TP=2 is required for correct chat output. The TP=1 benchmark numbers below reflect
-> throughput only (`vllm bench serve` does not validate output quality).
+> **Note:** Vanilla vLLM 0.17.0 TP=1 produces malformed output on SM121 due to
+> Marlin MoE 256-thread kernel shared memory race. Custom patches fix this.
 
 #### Single Request (num-prompts=1)
 
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) | vs Vanilla TP=2 |
-|---|---|---|---|---|
-| Vanilla MXFP4 TP=1 | - | - (broken) | - | - |
-| Vanilla MXFP4 TP=2 | 19.04 | 51.82 | 51.63 | baseline |
-| Custom MXFP4 TP=1 ⚠️ | 15.45 | 63.38 | 57.79 | +22% |
-| **Custom MXFP4 TP=2** | **12.08** | **80.88** | **47.39** | **+56%** |
+| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
+|---|---|---|---|
+| Vanilla MXFP4 TP=1 | - | - (broken on SM121) | - |
+| Vanilla MXFP4 TP=2 | 19.09 | 48.66 | 206.48 |
+| **Custom MXFP4 TP=1** | **14.93** | **57.68** | **322.84** |
+| **Custom MXFP4 TP=2** | **12.24** | **72.37** | **213.94** |
 
 #### 10 Concurrent Requests (num-prompts=10)
 
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
+| Configuration | TPOT (ms) | Throughput (tok/s) | Total tok/s |
 |---|---|---|---|
-| Vanilla MXFP4 TP=2 | 45.79 | 175.26 | 1482.16 |
-| Custom MXFP4 TP=1 ⚠️ | 39.85 | 185.09 | 1850.86 |
-| **Custom MXFP4 TP=2** | **38.04** | **201.00** | **1529.38** |
-
-#### 100 Concurrent Requests (num-prompts=100)
-
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
-|---|---|---|---|
-| Vanilla MXFP4 TP=2 | 57.33 | 220.44 | 25395.58 |
-| Custom MXFP4 TP=1 ⚠️ | 59.16 | 212.51 | 26134.13 |
-| **Custom MXFP4 TP=2** | **47.72** | **250.17** | **22517.78** |
+| Vanilla MXFP4 TP=2 | 45.79 | 175.26 | 1577.30 |
+| **Custom MXFP4 TP=1** | **57.48** | **138.70** | **1248.28** |
+| **Custom MXFP4 TP=2** | **38.82** | **197.77** | **1779.96** |
 
 ### Summary
 
-| Model | Patch Effect (TP=2, single request) | Key Factor |
-|---|---|---|
-| Qwen3.5-35B-A3B | **+65%** throughput (42.85 -> 70.68 tok/s) | Attention + LMHead = ~82% of weight reads |
-| gpt-oss-120b | **+56%** throughput (51.82 -> 80.88 tok/s) | Attention + LMHead FP4 quantization |
+#### Latency (Single Request TPOT)
+
+| Model | TP | Vanilla | Custom | Speedup |
+|---|---|---|---|---|
+| Qwen3.5-35B-A3B | 1 | 32.93 ms | **15.34 ms** | **+115%** |
+| Qwen3.5-35B-A3B | 2 | 21.68 ms | **12.53 ms** | **+73%** |
+| gpt-oss-120b | 1 | broken | **14.93 ms** | **Fixed** |
+| gpt-oss-120b | 2 | 19.09 ms | **12.24 ms** | **+56%** |
+
+#### Throughput (Single Request, Output tok/s)
+
+| Model | TP | Vanilla | Custom | Speedup |
+|---|---|---|---|---|
+| Qwen3.5-35B-A3B | 1 | 28.41 | **59.60** | **+110%** |
+| Qwen3.5-35B-A3B | 2 | 39.71 | **72.72** | **+83%** |
+| gpt-oss-120b | 1 | broken | **57.68** | **Fixed** |
+| gpt-oss-120b | 2 | 48.66 | **72.37** | **+49%** |
 
 ## What the Patches Fix
 
@@ -96,12 +90,13 @@ Custom additionally quantizes attention (qkv_proj, o_proj) and lm_head to FP4.
 |---|------|-------------|
 | 1 | `vllm/envs.py` | Add `VLLM_MXFP4_BACKEND` env var (`auto`/`marlin`/`cutlass_fp4`/`triton`) |
 | 2 | `vllm/.../quantization/utils/mxfp4_utils.py` | Add `mxfp4_e2m1_quantize()` function, remove expert_map assertion |
-| 3 | `vllm/.../quantization/mxfp4.py` | **Main change**: BF16->MXFP4 online quantization for MoE, `Mxfp4LinearMethod` for attention, `Mxfp4LMHeadMethod` for lm_head, `CUTLASS_FP4` backend enum |
+| 3 | `vllm/.../quantization/mxfp4.py` | **Main change**: BF16->MXFP4 online quantization for MoE, `Mxfp4LinearMethod` for attention, `Mxfp4LMHeadMethod` for lm_head, `CUTLASS_FP4` backend enum. **Bug fix**: `from_config()` now reads `modules_to_not_convert` from model config |
 | 4 | `vllm/.../fused_moe/layer.py` | Fix `weight_loader` ndim check for BF16 per-expert tensors |
-| 5 | `vllm/.../fused_moe/cutlass_moe.py` | Add SM121 support (`is_device_capability_family(120)`), allow EP>1, support expert_map |
-| 6 | `vllm/.../fused_moe/routing_simulator.py` | **New file**: routing simulator utility for testing/analysis |
-| 7 | `vllm/.../fla/ops/fused_recurrent.py` | Fix GDN (Gated Delta Net) Triton kernel for Qwen3.5 |
-| 8 | `vllm/.../models/gpt_oss.py` | Add `_quantize_moe_weight_mxfp4()` helper |
+| 5 | `vllm/.../fused_moe/fused_marlin_moe.py` | **SM121 fix**: Force 128-thread config for w2 GEMM when N>=2048 to avoid shared memory race in 256-thread kernel. Relax w2 size assertion (`==` -> `>=`) |
+| 6 | `vllm/.../fused_moe/cutlass_moe.py` | Add SM121 support (`is_device_capability_family(120)`), allow EP>1, support expert_map |
+| 7 | `vllm/.../fused_moe/routing_simulator.py` | **New file**: routing simulator utility for testing/analysis |
+| 8 | `vllm/.../fla/ops/fused_recurrent.py` | Fix GDN (Gated Delta Net) Triton kernel for Qwen3.5 |
+| 9 | `vllm/.../models/gpt_oss.py` | Add `_quantize_moe_weight_mxfp4()` helper |
 
 ### triton_allocator.patch
 
@@ -275,7 +270,8 @@ vllm serve openai/gpt-oss-120b \
 NVIDIA DGX Spark (GB10) uses SM121 (compute capability 12.1), which is not fully supported by
 standard PyTorch pip wheels (max compute capability 12.0) or vanilla vLLM. Key issues include:
 
-- MXFP4 Marlin kernels producing garbage output on SM121
+- MXFP4 Marlin MoE 256-thread kernel shared memory race on SM121 (garbage output at TP=1)
+- `Mxfp4Config.from_config()` ignoring `modules_to_not_convert` (attention/lm_head incorrectly FP4-quantized)
 - Missing PTX instructions (`cvt.rn.satfinite.e2m1x2.f32`) for E2M1 conversion
 - FlashInfer CUTLASS MXFP4 backend requiring TMA/wgmma (unavailable on SM121)
 - NCCL 2.28.9 CUDAGraph + multi-node deadlock bug

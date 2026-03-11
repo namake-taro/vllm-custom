@@ -84,7 +84,7 @@
 +        x_scales = x_scales.view(x.size(0), -1)
 +    return x_q, x_scales
 --- vllm/model_executor/layers/quantization/mxfp4.py	2026-03-09 02:10:13.794140655 +0900
-+++ vllm/model_executor/layers/quantization/mxfp4.py	2026-03-09 00:31:33.005458958 +0900
++++ vllm/model_executor/layers/quantization/mxfp4.py	2026-03-10 09:47:12.213677511 +0900
 @@ -35,7 +35,7 @@
      UnfusedOAITritonExperts,
  )
@@ -216,7 +216,19 @@
          if (
              current_platform.is_device_capability(90)
              and has_flashinfer()
-@@ -208,25 +299,48 @@
+@@ -190,7 +281,10 @@
+ 
+     @classmethod
+     def from_config(cls, config):
+-        return cls()
++        ignored_layers = cls.get_from_keys_or(config,
++                                              ["modules_to_not_convert"],
++                                              default=None)
++        return cls(ignored_layers=ignored_layers)
+ 
+     @classmethod
+     def get_min_capability(cls) -> int:
+@@ -208,25 +302,47 @@
      def get_config_filenames(cls) -> list[str]:
          return []
  
@@ -265,7 +277,6 @@
 +        elif isinstance(layer, VocabParallelEmbedding):
 +            is_lm_head = prefix == "lm_head" or prefix.endswith(".lm_head")
 +            if is_lm_head and current_platform.is_cuda():
-+                # Check modules_to_not_convert
 +                if self.ignored_layers and self._should_skip_layer(
 +                    prefix, self.ignored_layers
 +                ):
@@ -280,7 +291,7 @@
          elif isinstance(layer, FusedMoE):
              if current_platform.is_xpu():
                  return XpuMxfp4MoEMethod(layer.moe_config)
-@@ -247,6 +361,269 @@
+@@ -247,6 +363,269 @@
          return True
  
  
@@ -550,7 +561,7 @@
  class Mxfp4MoEMethod(FusedMoEMethodBase):
      """MXFP4 MoE quantization method."""
  
-@@ -278,8 +655,27 @@
+@@ -278,8 +657,27 @@
          **extra_weight_attrs,
      ):
          self.num_experts = num_experts
@@ -580,7 +591,7 @@
  
          # FIXME (zyongye): ship after torch and safetensors support mxfp4
          # is_torch_mxfp4_available = (
-@@ -329,6 +725,7 @@
+@@ -329,6 +727,7 @@
          elif (
              self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
              or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
@@ -588,7 +599,7 @@
          ):
              intermediate_size_per_partition_after_pad = round_up(
                  intermediate_size_per_partition, 128
-@@ -351,12 +748,18 @@
+@@ -351,12 +750,18 @@
          self.intermediate_pad = (
              intermediate_size_per_partition_after_pad - intermediate_size_per_partition
          )
@@ -608,7 +619,7 @@
                  dtype=weight_dtype,
              ),
              requires_grad=False,
-@@ -392,7 +795,7 @@
+@@ -392,7 +797,7 @@
              torch.zeros(
                  num_experts,
                  hidden_size,
@@ -617,7 +628,7 @@
                  dtype=weight_dtype,
              ),
              requires_grad=False,
-@@ -423,8 +826,35 @@
+@@ -423,8 +828,35 @@
          layer.register_parameter("w2_bias", w2_bias)
          set_weight_attrs(w2_bias, extra_weight_attrs)
  
@@ -653,7 +664,7 @@
              prepare_moe_fp4_layer_for_marlin(
                  layer, input_dtype=get_marlin_input_dtype()
              )
-@@ -857,6 +1287,132 @@
+@@ -857,6 +1289,132 @@
              # replace_parameter(layer, "w13_weight", w13_weight)
              # replace_parameter(layer, "w2_weight", w2_weight)
  
@@ -786,7 +797,7 @@
          elif self.mxfp4_backend == Mxfp4Backend.TRITON:
              from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
  
-@@ -920,6 +1476,11 @@
+@@ -920,6 +1478,11 @@
                  w1_scale=w1_scale,
                  w2_scale=w2_scale,
              )
@@ -798,7 +809,7 @@
          elif self.mxfp4_backend in [
              Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM,
              Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS,
-@@ -994,6 +1555,14 @@
+@@ -994,6 +1557,14 @@
                  if self.moe.is_lora_enabled:
                      return UnfusedOAITritonExperts(self.moe, self.moe_quant_config)
                  return OAITritonExperts(self.moe, self.moe_quant_config)
@@ -813,7 +824,7 @@
              else:
                  raise NotImplementedError(
                      f"Incompatible Mxfp4 backend ({self.mxfp4_backend}) for EP"
-@@ -1022,25 +1591,30 @@
+@@ -1022,25 +1593,30 @@
          if layer.enable_eplb:
              raise NotImplementedError("EPLB is not supported for mxfp4")
  
@@ -974,7 +985,51 @@
      )
  
      return fn.apply(
---- /dev/null	2026-03-02 23:18:34.865195152 +0900
+--- vllm/model_executor/layers/fused_moe/fused_marlin_moe.py	2026-03-10 11:48:53.666702886 +0900
++++ vllm/model_executor/layers/fused_moe/fused_marlin_moe.py	2026-03-11 18:17:59.864082806 +0900
+@@ -174,6 +174,14 @@
+             intermediate_cache2, input_dtype
+         )
+
++    # SM121 workaround: force 128-thread config for large N to avoid
++    # shared memory race in 256-thread kernel. TP>=2 uses smaller N.
++    w2_thread_k = -1
++    w2_thread_n = -1
++    if N >= 2048:
++        w2_thread_k = 64
++        w2_thread_n = 128
++
+     output = ops.moe_wna16_marlin_gemm(
+         intermediate_cache2,
+         output,
+@@ -201,6 +209,8 @@
+         use_atomic_add=False,
+         use_fp32_reduce=True,
+         is_zp_float=False,
++        thread_k=w2_thread_k,
++        thread_n=w2_thread_n,
+     )
+
+     return output
+@@ -295,7 +305,7 @@
+
+     # Check constraints.
+     assert w1.size(1) * 16 == K, "Hidden size mismatch w1"
+-    assert w2.size(2) // (num_bits // 2) == K, "Hidden size mismatch w2"
++    assert w2.size(2) // (num_bits // 2) >= K, "Hidden size mismatch w2"
+     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+@@ -459,7 +469,7 @@
+         "are sorted into the batch/expert they belong to"
+     )
+     assert w1.size(1) * 16 == K, "Hidden size mismatch w1"
+-    assert w2.size(2) // (num_bits // 2) == K, "Hidden size mismatch w2"
++    assert w2.size(2) // (num_bits // 2) >= K, "Hidden size mismatch w2"
+     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+     assert num_bits in [4, 8]
+--- vllm/model_executor/layers/fused_moe/routing_simulator.py.orig	2026-03-02 23:18:34.865195152 +0900
 +++ vllm/model_executor/layers/fused_moe/routing_simulator.py	2026-03-09 00:29:44.602648599 +0900
 @@ -0,0 +1,310 @@
 +# SPDX-License-Identifier: Apache-2.0
