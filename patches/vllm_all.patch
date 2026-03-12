@@ -216,19 +216,7 @@
          if (
              current_platform.is_device_capability(90)
              and has_flashinfer()
-@@ -190,7 +281,10 @@
- 
-     @classmethod
-     def from_config(cls, config):
--        return cls()
-+        ignored_layers = cls.get_from_keys_or(config,
-+                                              ["modules_to_not_convert"],
-+                                              default=None)
-+        return cls(ignored_layers=ignored_layers)
- 
-     @classmethod
-     def get_min_capability(cls) -> int:
-@@ -208,25 +302,47 @@
+@@ -208,25 +281,47 @@
      def get_config_filenames(cls) -> list[str]:
          return []
  

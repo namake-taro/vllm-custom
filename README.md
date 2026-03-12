@@ -1,5 +1,13 @@
 # vLLM 0.17.0 Patches for DGX Spark (GB10 / SM121)
 
+> **⚠️ Known Issue: Potential accuracy degradation with MXFP4 attention quantization**
+>
+> On SM121 (GB10), MXFP4 quantization of attention layers (qkv_proj, o_proj) may produce
+> degraded output quality (e.g., repetitive/looping text at temperature=0).
+> We suspect this is the same shared memory race condition in the Marlin 256-thread kernel
+> that was already fixed for MoE layers (`fused_marlin_moe.py`), now affecting the dense
+> Marlin kernel used by attention `o_proj`. Investigation and fix are in progress.
+
 Patches to enable MXFP4 quantized inference on NVIDIA DGX Spark (GB10, SM121) with vLLM 0.17.0.
 
 Vanilla vLLM 0.17.0 pip wheels do not fully support SM121 (compute capability 12.1).
@@ -90,7 +98,7 @@ and includes SM121 Marlin MoE thread fix for correct TP=1 output.
 |---|------|-------------|
 | 1 | `vllm/envs.py` | Add `VLLM_MXFP4_BACKEND` env var (`auto`/`marlin`/`cutlass_fp4`/`triton`) |
 | 2 | `vllm/.../quantization/utils/mxfp4_utils.py` | Add `mxfp4_e2m1_quantize()` function, remove expert_map assertion |
-| 3 | `vllm/.../quantization/mxfp4.py` | **Main change**: BF16->MXFP4 online quantization for MoE, `Mxfp4LinearMethod` for attention, `Mxfp4LMHeadMethod` for lm_head, `CUTLASS_FP4` backend enum. **Bug fix**: `from_config()` now reads `modules_to_not_convert` from model config |
+| 3 | `vllm/.../quantization/mxfp4.py` | **Main change**: BF16->MXFP4 online quantization for MoE, `Mxfp4LinearMethod` for attention, `Mxfp4LMHeadMethod` for lm_head, `CUTLASS_FP4` backend enum |
 | 4 | `vllm/.../fused_moe/layer.py` | Fix `weight_loader` ndim check for BF16 per-expert tensors |
 | 5 | `vllm/.../fused_moe/fused_marlin_moe.py` | **SM121 fix**: Force 128-thread config for w2 GEMM when N>=2048 to avoid shared memory race in 256-thread kernel. Relax w2 size assertion (`==` -> `>=`) |
 | 6 | `vllm/.../fused_moe/cutlass_moe.py` | Add SM121 support (`is_device_capability_family(120)`), allow EP>1, support expert_map |
@@ -271,7 +279,6 @@ NVIDIA DGX Spark (GB10) uses SM121 (compute capability 12.1), which is not fully
 standard PyTorch pip wheels (max compute capability 12.0) or vanilla vLLM. Key issues include:
 
 - MXFP4 Marlin MoE 256-thread kernel shared memory race on SM121 (garbage output at TP=1)
-- `Mxfp4Config.from_config()` ignoring `modules_to_not_convert` (attention/lm_head incorrectly FP4-quantized)
 - Missing PTX instructions (`cvt.rn.satfinite.e2m1x2.f32`) for E2M1 conversion
 - FlashInfer CUTLASS MXFP4 backend requiring TMA/wgmma (unavailable on SM121)
 - NCCL 2.28.9 CUDAGraph + multi-node deadlock bug
