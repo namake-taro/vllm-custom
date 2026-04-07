@@ -1,156 +1,87 @@
-# vLLM 0.17.0 / 0.17.1 Patches for DGX Spark (GB10 / SM121)
+# vLLM custom (for DGX Spark): STREAM LOADING
 
-[日本語版](README.ja.md)
+[日本語](README.ja.md)
 
-Patches to enable high-performance MXFP4 quantized inference on NVIDIA DGX Spark (GB10, SM121) with vLLM 0.17.0 / 0.17.1.
+* This project is conducted for personal interest, learning, and research purposes. Please use it for research and similar purposes.
 
-Vanilla vLLM 0.17.0 / 0.17.1 pip wheels do not fully support SM121 (compute capability 12.1).
-These patches fix MXFP4 quantization, add BF16-to-MXFP4 online quantization, apply per-layer optimal precision,
-and fix SM121-specific kernel bugs -- enabling up to **2x decode throughput** for models such as
-**Qwen3.5-35B-A3B** and **openai/gpt-oss-120b**.
+## Why STREAM LOADING
 
-If you have a DGX Spark and a few minutes to spare, give it a try.
+* DGX Spark users have faced a difficult situation when new large models are released: they often have to wait a long time for 4-bit pre-quantized versions to become available before they can try them out — even when the model would fit in 128 GiB of memory if only it could be quantized to 4 bits on the fly.
+* Because vLLM targets many platforms, it is very hard to extract maximum performance on the DGX Spark memory architecture out of the box.
+* For example, when quantizing BF16 weights down to 4 bits, the default vLLM requires both the full BF16 dataset and the converted 4-bit dataset to be held in memory at the same time. Models that don't fit in 128 GiB at the BF16 stage cannot be loaded, even if they would fit comfortably after 4-bit quantization.
+* STREAM LOADING removes this "you must read all of BF16 before you can quantize it" constraint by **reading just the necessary expert / layer chunks from storage, quantizing them to 4 bits on the fly, and placing the result on the GPU**, so the model can be loaded using only the memory required by the 4-bit form. (Unfortunately, startup time grows significantly.)
 
-### Key improvements
 
-- **BF16 -> MXFP4 online quantization** for MoE experts, QKV, and lm_head (vanilla only supports pre-quantized models)
-- **Per-layer optimal precision**: MXFP4 for QKV/lm_head, FP8 Marlin for o_proj (E2M1 causes quality degradation on o_proj)
-- **SM121 Marlin MoE 256-thread kernel fix** (shared memory race producing garbage output at TP=1)
-- **`modules_to_not_convert` config bug fix** (vanilla ignores this field, causing quality degradation on gpt-oss-120b)
-- **GDN Triton kernel fix** for Qwen3.5-35B-A3B
+## STREAM LOADING — main feature and supporting features
 
-## Quantization Configuration
+### STREAM LOADING
 
-Each layer uses the lowest precision that maintains output quality.
-Decode is bandwidth-bound on GB10 -- lower precision = faster.
+* It works not only for models with shards laid out neatly in expert order (such as gpt-oss and Qwen), but also for models like Nemotron whose shards are not in expert order, by using random-access loading to perform stream quantization.
+* The load buffer required at startup is only "the size of one quantization unit", which makes it possible to run very large models that would otherwise not fit on a single GB10 node at all.
+* Example: **Qwen3.5-397B-A17B-FP8** (weights alone are about 96.7 GiB/GPU at TP=2) runs on DGX Spark.
 
-The configuration below was selected by exhaustively testing all reasonable precision combinations per layer,
-choosing the one that maximizes performance while maintaining output quality.
+### NF4 quantization (a sub-mode of MXFP4)
 
-| Layer | Precision | Kernel | bytes/param | Notes |
-|-------|-----------|--------|-------------|-------|
-| **MoE experts** (w1, w2, w3) | MXFP4 (E2M1) | Marlin FP4 | 0.5 + scale | Pre-quantized or online quantized |
-| **QKV** (q_proj, k_proj, v_proj) | MXFP4 (E2M1) | Marlin FP4 | 0.5 + scale | Softmax normalizes quantization error |
-| **o_proj** | FP8 (E4M3) | Marlin FP8 | 1.0 | E2M1 causes long-form repetition loops |
-| **lm_head** | MXFP4 (E2M1) | Marlin FP4 | 0.5 + scale | BF16 fallback when `tie_word_embeddings=True` |
-| embed_tokens | BF16 | -- | 2.0 | Embedding gather, not a GEMM |
-| router | BF16 | -- | 2.0 | Negligible size (~13 MB) |
-| layer_norm | BF16 | -- | 2.0 | Negligible size (~0.4 MB) |
+* MXFP4 (E2M1) achieves speedup by reducing data transfer through 4-bit quantization. However, output quality degradation due to quantization error is unavoidable.
+* To address this, we implemented **MXFP4(NF4) quantization** as a sub-mode of MXFP4.
+* MXFP4 quantizes data into 16 levels (4 bits) **uniformly**. By replacing this uniform spacing with a **16-level partition based on the normal distribution**, we were able to dramatically improve precision.
+* It is launched within the `--quantization mxfp4` framework, and you can switch between MXFP4 / NF4 / FP8 per layer using environment variables such as `VLLM_NF4_LAYERS`.
 
-The following kernels were evaluated for each layer, and the optimal combination was selected:
-Marlin FP4 (MXFP4), Marlin FP8, torch.\_scaled\_mm (cuBLAS FP8), CUTLASS FP4 (mma.sync.block\_scale),
-FlashInfer CUTLASS MXFP4 (TMA WarpSpecialized, incompatible with SM121), and BF16 (unquantized baseline).
+### Automatic KV cache allocation
 
-Since GB10 decode is memory-bandwidth-bound, Marlin (which reads pre-quantized weights directly)
-outperformed CUTLASS FP4 (+28% slower due to activation quantization overhead) and cuBLAS FP8 (-8.6% vs Marlin FP8).
-MXFP4 o_proj achieved 81.6 tok/s but caused infinite loops in long generation -- FP8 Marlin (80.6 tok/s) maintains correct output at nearly the same speed.
+* Until now, DGX Spark users had to find the optimal `--gpu-memory-utilization` value by trial and error, shifting it by 0.1 at a time, in order to maximize KV cache memory.
+* Once STREAM LOADING enables huge models, the weights consume most of the free memory, making this manual tuning even harder.
+* So with `auto` (the default), the patch was modified to allocate KV cache size at the maximum of currently available memory.
+* It first allocates a minimal KV cache, then after `torch.compile` and FlashInfer JIT compilation, it releases the KV cache, recomputes available memory, and re-allocates KV cache up to the limit. The caching allocator's fragmentation pool is also taken into account, which avoids OOM during inference.
+* Users can also configure the margin from the memory limit via an environment variable, to leave headroom for memory used during inference.
 
-GB10 memory bandwidth is 273 GB/s. With the above quantization configuration, gpt-oss-120b reads approximately 2.9 GB of active weights per token, giving a theoretical bandwidth ceiling of ~93 tok/s (TP=1).
 
-Assuming each decode step reads all active weights once at 100% peak bandwidth:
+## Benchmark results
 
-```
-2.94 (GB/token) / 273 (GB/s) = 10.8 (ms/token)
-1000 (ms) / 10.8 (ms/token) = 92.6 (token/sec)
-```
+* You will notice that some of the entries below are configurations that, normally, should be impossible to run at TP=1 or TP=2. (The models below are NOT pre-quantized 4-bit models such as Int4 or NVFP4.)
+* These results use default values for most settings, including the layer assignments. Further tuning is likely possible.
+* Throughput numbers come from `llama-benchy`.
 
-The gap between the theoretical 93 tok/s and the measured 62 tok/s is primarily due to GEMM kernel efficiency and non-GEMM compute overhead. This suggests that vLLM-level tuning is close to the practical limit.
-Significant further speedup would require kernel optimization, more aggressive quantization, or speculative decoding (e.g. EAGLE3) to generate multiple tokens per decode step.
+### Throughput
 
-## Benchmark Results
+* Decode throughput, single request (tg128, c1, tokens/s)
 
-Measured with `vllm bench serve` (input: 1024 tokens, output: 128 tokens, random dataset).
-Hardware: DGX Spark (GB10 x2), 128 GB unified memory per node, RoCE RDMA interconnect.
+| Model | TP=1 | TP=2 |
+|--------|------|------|
+| gpt-oss-120b | 64.52 | **79.55** |
+| Qwen3.5-35B-A3B | 64.37 | **78.45** |
+| Qwen3.5-27B | 12.07 | **20.46** |
+| Qwen3.5-122B-A10B | 28.17 | **41.90** |
+| Nemotron3-120B-A12B-BF16 | 24.11 | **36.58** |
+| Qwen3.5-397B-A17B-FP8 | - | **26.83** |
 
-### Qwen3.5-35B-A3B
+* Decode throughput, 10 concurrent requests (tg128, c10, tokens/s, total)
 
-BF16 checkpoint. Vanilla runs BF16 inference (no MXFP4 support for BF16 models).
-Patched applies BF16 -> MXFP4 online quantization via Marlin backend.
+| Model | TP=1 | TP=2 |
+|--------|------|------|
+| gpt-oss-120b | 165.02 | 198.19 |
+| Qwen3.5-35B-A3B | 208.31 | 161.37 |
+| Qwen3.5-27B | 92.54 | 95.18 |
+| Qwen3.5-122B-A10B | 74.90 | 75.11 |
+| Nemotron3-120B-A12B-BF16 | 84.56 | 61.48 |
+| Qwen3.5-397B-A17B-FP8 | - | 50.98 |
 
-#### Single Request (num-prompts=1, warm)
 
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
-|---|---|---|---|
-| Vanilla BF16 TP=1 | 32.93 | 28.41 | 327.34 |
-| Vanilla BF16 TP=2 | 21.68 | 39.71 | 469.77 |
-| **Patched MXFP4 TP=1** | **15.18** | **60.06** | **203.52** |
-| **Patched MXFP4 TP=2** | **12.92** | **70.83** | **166.28** |
+### KV cache size
 
-#### 10 Concurrent Requests (num-prompts=10)
+| Model | TP=1 KV cache (tokens) | TP=1 max concurrency | TP=2 KV cache (tokens) | TP=2 max concurrency |
+|--------|------------------------|----------------------|------------------------|----------------------|
+| gpt-oss-120b | 962,352 | 11.74x | 3,395,392 | 41.41x |
+| Qwen3.5-35B-A3B | 1,852,864 | 26.80x | 4,106,064 | 59.38x |
+| Qwen3.5-27B | 500,192 | 7.33x | 1,204,224 | 17.67x |
+| Qwen3.5-122B-A10B | 538,704 | 7.48x | 2,405,376 | 33.41x |
+| Nemotron3-120B-A12B-BF16 | 772,992 | 11.44x | 4,456,320 | 65.99x |
+| Qwen3.5-397B-A17B-FP8 | - | - | 91,872 | 2.32x |
 
-| Configuration | TPOT (ms) | Throughput (tok/s) | Total tok/s |
-|---|---|---|---|
-| Vanilla BF16 TP=1 | 88.86 | 76.92 | 692.24 |
-| Vanilla BF16 TP=2 | 74.77 | 91.25 | 821.24 |
-| **Patched MXFP4 TP=1** | **44.32** | **172.04** | **1548.40** |
-| **Patched MXFP4 TP=2** | **35.20** | **144.79** | **1303.07** |
+* The default leaves a 1 GiB margin for OOM safety.
 
-### openai/gpt-oss-120b
+* `max concurrency` is the multiplier for how many `max_model_len`-token prompts can fit simultaneously.
 
-MXFP4 pre-quantized checkpoint. Both vanilla and patched use MXFP4 for MoE experts.
-Patched additionally quantizes QKV (MXFP4 Marlin), o_proj (FP8 Marlin), and lm_head (MXFP4 Marlin),
-and includes the SM121 Marlin MoE thread fix for correct TP=1 output.
-
-> **Note:** Vanilla vLLM 0.17.0 / 0.17.1 TP=1 produces garbage output on SM121 due to
-> Marlin MoE 256-thread kernel shared memory race. Patched fixes this.
-
-#### Single Request (num-prompts=1, warm)
-
-| Configuration | TPOT (ms) | Throughput (tok/s) | TTFT (ms) |
-|---|---|---|---|
-| Vanilla MXFP4 TP=1 | -- | -- (broken on SM121) | -- |
-| Vanilla MXFP4 TP=2 | 19.09 | 48.66 | 206.48 |
-| **Patched TP=1** | **15.87** | **61.78** | **56.39** |
-| **Patched TP=2** | **12.33** | **79.28** | **48.85** |
-
-#### 10 Concurrent Requests (num-prompts=10)
-
-| Configuration | TPOT (ms) | Throughput (tok/s) | Total tok/s |
-|---|---|---|---|
-| Vanilla MXFP4 TP=2 | 45.79 | 175.26 | 1577.30 |
-| **Patched TP=1** | **66.02** | **148.24** | **1334.13** |
-| **Patched TP=2** | **44.15** | **181.31** | **1631.76** |
-
-### Summary
-
-#### Latency (Single Request TPOT)
-
-| Model | TP | Vanilla | Patched | Speedup |
-|---|---|---|---|---|
-| Qwen3.5-35B-A3B | 1 | 32.93 ms | **15.18 ms** | **+117%** |
-| Qwen3.5-35B-A3B | 2 | 21.68 ms | **12.92 ms** | **+68%** |
-| gpt-oss-120b | 1 | broken | **15.87 ms** | **Fixed** |
-| gpt-oss-120b | 2 | 19.09 ms | **12.33 ms** | **+55%** |
-
-#### Throughput (Single Request, Output tok/s)
-
-| Model | TP | Vanilla | Patched | Speedup |
-|---|---|---|---|---|
-| Qwen3.5-35B-A3B | 1 | 28.41 | **60.06** | **+111%** |
-| Qwen3.5-35B-A3B | 2 | 39.71 | **70.83** | **+78%** |
-| gpt-oss-120b | 1 | broken | **61.78** | **Fixed** |
-| gpt-oss-120b | 2 | 48.66 | **79.28** | **+63%** |
-
-## What the Patches Fix
-
-### vllm_all.patch (9 files)
-
-| # | File | Description |
-|---|------|-------------|
-| 1 | `vllm/envs.py` | Add `VLLM_MXFP4_BACKEND` env var (`auto`/`marlin`/`cutlass_fp4`/`triton`) |
-| 2 | `vllm/.../quantization/mxfp4.py` | **Main change**: BF16->MXFP4 online quantization for MoE, `Mxfp4LinearMethod` for QKV, `Fp8MarlinOProjLinearMethod` for o_proj, `Mxfp4LMHeadMethod` for lm_head, `from_config()` bug fix for `modules_to_not_convert` |
-| 3 | `vllm/.../quantization/utils/mxfp4_utils.py` | Add `mxfp4_e2m1_quantize()` function, remove expert_map assertion |
-| 4 | `vllm/.../fused_moe/fused_marlin_moe.py` | **SM121 fix**: Force 128-thread config for w2 GEMM when N>=2048 to avoid shared memory race in 256-thread kernel |
-| 5 | `vllm/.../fused_moe/layer.py` | Fix `weight_loader` ndim check for BF16 per-expert tensors |
-| 6 | `vllm/.../fused_moe/cutlass_moe.py` | Add SM121 support, allow EP>1, support expert_map |
-| 7 | `vllm/.../fused_moe/routing_simulator.py` | **New file**: MoE routing simulator utility |
-| 8 | `vllm/.../fla/ops/fused_recurrent.py` | Fix GDN (Gated Delta Net) Triton kernel for Qwen3.5 |
-| 9 | `vllm/.../models/gpt_oss.py` | Add `_quantize_moe_weight_mxfp4()` helper |
-
-### flashinfer_cutlass_sfb_layout_fix.patch
-
-Fixes a copy-paste bug in FlashInfer 0.6.4's bundled CUTLASS 4.2.1 headers where `layout_SFB`
-initialization incorrectly uses `tile_atom_to_shape_SFA`. Only affects CUTLASS_FP4 backend.
 
 ## Installation
 
@@ -159,47 +90,28 @@ initialization incorrectly uses `tile_atom_to_shape_SFA`. Only affects CUTLASS_F
 - NVIDIA DGX Spark (GB10 / SM121)
 - Python 3.12
 - CUDA 13.0
+- (For TP=2) Two DGX Spark nodes + multi-node communication setup
+- vLLM custom (based on vLLM 0.17.1)
 
-### Step 1: Create venv and install vLLM
+### Step 1: Create venv
 
 ```bash
 python3 -m venv ~/.python-vllm-custom
 source ~/.python-vllm-custom/bin/activate
-
-pip install vllm --extra-index-url https://wheels.vllm.ai/0.17.1/cu130 \
-                 --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-### Step 2: Install / upgrade dependencies
+### Step 2: Install vLLM custom
 
 ```bash
-# Upgrade NCCL (pip bundles 2.28.9 which has CUDAGraph + multi-node deadlock bug)
-pip install 'nvidia-nccl-cu13>=2.29.2'
-
-# Pin compatible versions
-pip install 'transformers==5.3.0'
-pip install 'huggingface_hub==1.5.0'
-
-# Install fastsafetensors for fast model loading
-pip install fastsafetensors
+# vLLM 0.17.1-based custom wheel
+pip install --extra-index-url https://download.pytorch.org/whl/cu130 \
+  https://github.com/namake-taro/vllm-custom/releases/download/v0.17.1+sparkcustom.00efb251a6/vllm-0.17.1+sparkcustom.00efb251a6.precompiled-cp312-cp312-linux_aarch64.whl
+pip install 'nvidia-nccl-cu13>=2.29.2' > /dev/null 2>&1
 ```
 
-> **Note:** `huggingface_hub >= 1.6.0` causes Harmony parser errors with gpt-oss models. Pin to 1.5.0.
+> The complete modified source package is available on the [Releases page](https://github.com/namake-taro/vllm-custom/releases) as `.src.tar.gz`.
 
-### Step 3: Apply patches
-
-```bash
-SITE=~/.python-vllm-custom/lib/python3.12/site-packages
-cd "$SITE"
-
-# Apply vLLM patch (required)
-patch -p0 < /path/to/patches/vllm_all.patch
-
-# Apply FlashInfer CUTLASS fix (only needed for CUTLASS_FP4 backend)
-patch -p0 < /path/to/patches/flashinfer_cutlass_sfb_layout_fix.patch
-```
-
-### Step 4: Clear caches
+### Step 3: Clear caches
 
 ```bash
 rm -rf ~/.cache/flashinfer/
@@ -208,117 +120,150 @@ rm -rf ~/.cache/vllm/torch_aot_compile/
 rm -rf /tmp/torchinductor_$(whoami)/
 ```
 
-> **Note:** Always clear caches before every `vllm serve` launch. Stale caches can cause infinite repetition loops in long-form generation even with a correct configuration.
+> Note: Always clear the caches before each `vllm serve`. Stale caches can cause infinite-loop generation in long-form output even with otherwise correct configurations.
 
-### Step 5: Multi-node setup (TP=2 only)
 
-Sync the entire venv to the remote node:
+## How to run and configure
 
-```bash
-REMOTE=<remote-node-ip>
-
-rsync -a ~/.python-vllm-custom/ $REMOTE:~/.python-vllm-custom/
-
-# Clear caches on remote node too
-ssh $REMOTE "rm -rf ~/.cache/flashinfer/ ~/.cache/vllm/torch_compile_cache/ ~/.cache/vllm/torch_aot_compile/ /tmp/torchinductor_\$(whoami)/"
-```
-
-> **Note:** Always clear caches before every `vllm serve` launch. Stale caches can cause infinite repetition loops in long-form generation even with a correct configuration.
-
-## Running
+* For most BF16 / FP8 models, as long as the 4-bit-quantized form fits in memory, you can run them just by adding `--quantization mxfp4` to `vllm serve`, with the default settings or only minor changes. You no longer need to set `--gpu-memory-utilization` (the default is now `auto`).
 
 ### Environment variables
 
 ```bash
-# MXFP4 backend (marlin is required for correct output)
-export VLLM_MXFP4_BACKEND=marlin
+# === Required for STREAM LOADING ===
+
+# Enable / disable stream loading (ON=1, OFF=0)
+export VLLM_STREAM_LOADING=1
+
+# GB10 does not support GDS (GPUDirect Storage), so set this to 1
 export VLLM_FASTSAFETENSORS_NOGDS=1
 
-# Performance tuning
-export VLLM_MARLIN_USE_ATOMIC_ADD=1          # Faster Marlin reduce for small N (SM>=90 BF16 atomicAdd)
-export CUDA_DEVICE_MAX_CONNECTIONS=1          # Serialize CUDA streams for better NCCL overlap
-export PYTORCH_ALLOC_CONF=expandable_segments:True  # Reduce memory fragmentation
+# MXFP4 backend (marlin is required for correct output)
+export VLLM_MXFP4_BACKEND=marlin
 
-# For multi-node (adjust interface names for your setup)
+
+# Switch quantization method per layer (comma-separated, multiple entries allowed)
+# Priority: FP8 > NF4 > MXFP4
+# `all` applies to every quantizable layer
+export VLLM_FP8_LAYERS=
+export VLLM_NF4_LAYERS=all
+export VLLM_MXFP4_LAYERS=
+
+# NF4 quantization group size
+# 32, 64, 128, 256, 512 (32 gives the best output quality)
+export VLLM_NF4_GROUP_SIZE=128
+
+# Free memory margin (MiB) reserved when allocating KV cache.
+# The default leaves headroom for safety.
+# However, shrinking the margin too much can cause OOM even during llama-benchy runs.
+export VLLM_KV_CACHE_MEM_MARGIN=1024
+
+# Other example settings
+export VLLM_MARLIN_USE_ATOMIC_ADD=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 export NCCL_IB_DISABLE=0
 export NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1
 export NCCL_NET_GDR_LEVEL=5
 export NCCL_PROTO=LL,LL128,Simple
 export NCCL_SOCKET_IFNAME=enp1s0f1np1
-export VLLM_HOST_IP=$(ip -o -4 addr show enp1s0f1np1 | awk '{print $4}' | cut -d/ -f1)
-export RAY_memory_usage_threshold=0.99
-export VLLM_RPC_TIMEOUT=1800
-
-export CUDA_VISIBLE_DEVICES=0
-export HF_HUB_OFFLINE=1
 ```
 
-### Launch commands
+
+## Example launch commands
+
+### openai/gpt-oss-120b (TP=1)
 
 ```bash
-# Qwen3.5-35B-A3B (BF16 -> MXFP4 online quantization, TP=2)
-vllm serve Qwen/Qwen3.5-35B-A3B \
-  --served-model-name local-vllm \
-  --host 0.0.0.0 \
-  --quantization mxfp4 \
-  --load-format fastsafetensors \
-  --reasoning-parser qwen3 \
-  --distributed-executor-backend ray \
-  --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.80 \
-  --kv-cache-dtype fp8 \
-  --enable-prefix-caching \
-  --language-model-only \
-  --max-model-len 262144 \
-  --max-num-batched-tokens 32768 \
-  --max-num-seqs 16 \
-  --max-cudagraph-capture-size 32
-
-# openai/gpt-oss-120b (MXFP4 pre-quantized, TP=2)
 vllm serve openai/gpt-oss-120b \
-  --served-model-name local-vllm \
   --host 0.0.0.0 \
-  --quantization mxfp4 \
+  --port 8000 \
+  --max-num-seqs 10 \
+  --max-num-batched-tokens 32768 \
+  --max-cudagraph-capture-size 32 \
+  --max-model-len 131072 \
+  --enable-prefix-caching \
   --enable-auto-tool-choice \
   --tool-call-parser openai \
   --reasoning-parser openai_gptoss \
-  --load-format fastsafetensors \
-  --distributed-executor-backend ray \
-  --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.80 \
   --kv-cache-dtype fp8 \
-  --enable-prefix-caching \
-  --max-model-len 131072 \
-  --max-num-batched-tokens 32768 \
-  --max-num-seqs 16 \
-  --max-cudagraph-capture-size 32
+  --quantization mxfp4 \
+  --load-format fastsafetensors \
+  --tensor-parallel-size 1 \
+  --swap-space 0
 ```
 
-## Important Notes
+### Qwen/Qwen3.5-397B-A17B-FP8 (TP=2)
 
-- **o_proj must use FP8, not MXFP4.** E2M1 quantization error accumulates through the residual path across 36 layers, causing infinite repetition loops in long-form generation. The patch handles this automatically.
-- **NCCL version check:** `pip install` may downgrade NCCL to 2.28.9. Always verify with `pip show nvidia-nccl-cu13` after installing any package.
-- **Cache clearing:** After applying patches or changing TP size, clear torch.compile and FlashInfer caches on **all nodes**.
-- **`--gpu-memory-utilization 0.80`:** GB10 unified memory requires conservative allocation. Lower to 0.70 if OOM occurs during CUDAGraph capture.
-- **Quality testing:** Short-form tests (256 tokens) cannot detect the o_proj precision issue. Always validate with long-form streaming generation (1000+ tokens, temperature=0) after any quantization change.
-- For gpt-oss-120b vocab TIKTOKEN configuration, please refer to other resources.
+> **Note:** For extreme cases like 397B, where weights exceed 96 GiB per node, you need to keep `--max-num-batched-tokens` and `--max-cudagraph-capture-size` small to minimize transient warmup memory consumption. For other smaller models, the usual values around `32768` / `32` are fine.
 
-## Package Versions
+```bash
+vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --max-num-seqs 10 \
+  --max-num-batched-tokens 4176 \
+  --max-cudagraph-capture-size 8 \
+  --language-model-only \
+  --kv-cache-dtype fp8 \
+  --max-model-len 131072 \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --quantization mxfp4 \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --swap-space 0
+```
 
-| Package | Version |
-|---------|---------|
-| vllm | 0.17.0+cu130 or 0.17.1+cu130 |
-| torch | 2.10.0+cu130 |
-| triton | 3.6.0 |
-| nvidia-nccl-cu13 | >= 2.29.2 |
-| fastsafetensors | 0.2.2 |
-| flashinfer-python | 0.6.4 |
-| transformers | 5.3.0 |
-| huggingface_hub | 1.5.0 |
 
-This work builds on the efforts of the DGX Spark community who identified and documented these SM121 issues.
-See: [DGX Spark SM121 Software Support Discussion (NVIDIA Forums)](https://forums.developer.nvidia.com/t/dgx-spark-sm121-software-support-is-severely-lacking-official-roadmap-needed/357663)
+## About per-layer quantization assignments
+
+### Quick command to display layer info
+
+* You can use the `tools/list_layers.py` script bundled in the repository to inspect the quantizable layers of a model.
+
+```
+./tools/list_layers.py openai/gpt-oss-120b
+```
+
+This produces the layer information for openai/gpt-oss-120b:
+
+```
+Layer Name             Category         N Shape                  Size
+------------------------------------------------------------------------
+embed_tokens           embedding        1 (201088, 2880)         1104.6 MB
+k_proj                 linear          36 (512, 2880)            2.8 MB
+o_proj                 linear          36 (2880, 4096)           22.5 MB
+q_proj                 linear          36 (4096, 2880)           22.5 MB
+router                 linear          36 (128, 2880)            720 KB
+v_proj                 linear          36 (512, 2880)            2.8 MB
+lm_head                lm_head          1 (201088, 2880)         1104.6 MB
+down_proj_bias         moe_packed      36 (128, 2880)            720 KB
+down_proj_blocks       moe_packed      36 (128, 2880, 90, 16)    506.2 MB
+gate_up_proj_bias      moe_packed      36 (128, 5760)            1.4 MB
+gate_up_proj_blocks    moe_packed      36 (128, 5760, 90, 16)    1012.5 MB
+```
+
+### Example environment variable settings based on layer info
+
+* For example, with gpt-oss-120b you might use the following settings, based on the output above.
+* Priority: FP8 > NF4 > MXFP4.
+
+```bash
+export VLLM_FP8_LAYERS=o_proj,lm_head
+export VLLM_NF4_LAYERS=moe,q_proj,k_proj,v_proj
+export VLLM_MXFP4_LAYERS=all
+```
+
+
+## Acknowledgements
+
+* This work is built on top of the efforts of the NVIDIA Developer Forum DGX Spark community, who identified and documented the DGX Spark, GB10, and SM121 issues.
+Reference: [Computing / DGX Spark / GB10 User Forum topics - NVIDIA Developer Forums](https://forums.developer.nvidia.com/c/accelerated-computing/dgx-spark-gb10/)
+
 
 ## License
 
-These patches are provided as-is for the DGX Spark community. The underlying vLLM project is licensed under Apache-2.0.
+* These sources are provided as-is to the DGX Spark community. The vLLM project itself is licensed under Apache-2.0.
